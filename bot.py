@@ -23,8 +23,6 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 # ========= 依存（簡易KV: aiosqlite不要版）=========
-# Railway のコンテナFSでも動くよう JSON で簡易保存します
-# （将来 Shared Disk に切替える場合もコード変更はこの部分のみ）
 DB_PATH = "bot_kv.json"
 _db_lock = asyncio.Lock()
 
@@ -84,6 +82,25 @@ def extract_first_image_url(text: str) -> str | None:
         if is_image_url(m):
             return m
     return None
+
+# メッセージリンク解析 → message を取得
+MSG_LINK_RE = re.compile(
+    r"https?://(?:ptb\.|canary\.)?discord\.com/channels/(?P<guild_id>\d+)/(?P<channel_id>\d+)/(?P<message_id>\d+)"
+)
+
+async def fetch_message_from_link(bot: commands.Bot, link: str) -> discord.Message | None:
+    m = MSG_LINK_RE.match(link.strip())
+    if not m:
+        return None
+    ch_id = int(m.group("channel_id"))
+    msg_id = int(m.group("message_id"))
+    ch = bot.get_channel(ch_id)
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return None
+    try:
+        return await ch.fetch_message(msg_id)
+    except Exception:
+        return None
 
 # ========= Discord 本体 =========
 intents = discord.Intents.default()
@@ -289,25 +306,34 @@ async def board_panel(interaction: discord.Interaction, channel: discord.TextCha
 
 @board_group.command(name="reveal", description="匿名投稿の実投稿者を照会（指定ユーザー限定）")
 @guild_deco
-@app_commands.describe(message="対象メッセージ（リンク or 直指定）")
-async def board_reveal(interaction: discord.Interaction, message: discord.Message):
+@app_commands.describe(message_link="対象メッセージのリンク（右クリック→リンクをコピー）")
+async def board_reveal(interaction: discord.Interaction, message_link: str):
     if interaction.user.id not in ALLOWED_USER_IDS:
         return await interaction.response.send_message("このコマンドを使う権限がありません。", ephemeral=True)
-    data_s = await kv_get(gkey_postmap(message.id))
+
+    # メッセージ取得
+    msg = await fetch_message_from_link(interaction.client, message_link)
+    if not msg:
+        return await interaction.response.send_message("メッセージリンクが無効です。正しいリンクを指定してください。", ephemeral=True)
+
+    data_s = await kv_get(gkey_postmap(msg.id))
     if not data_s:
-        return await interaction.response.send_message("記録がありません（匿名掲示板の投稿ではない可能性）。", ephemeral=True)
+        return await interaction.response.send_message("このメッセージの記録が見つかりません。匿名掲示板の投稿ではない可能性があります。", ephemeral=True)
+
     info = json.loads(data_s)
     desc = (
         f"**匿名？** {'はい' if info.get('anonymous') else 'いいえ'}\n"
         f"**匿名表示名**: {info.get('anon_display') or '-'}\n"
         f"**実投稿者**: <@{info.get('author_id')}> (`{info.get('author_name')}` / 表示名: `{info.get('author_display')}`)\n"
-        f"**メッセージ**: {message.jump_url}"
+        f"**メッセージ**: {msg.jump_url}"
     )
     await interaction.response.send_message(desc, ephemeral=True)
 
 # ---- /ping ----
 @tree.command(name="ping", description="生存確認")
-@guild_deco
+def _guild_wrap(func):
+    return guild_deco(func)
+@_guild_wrap
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong! 🏓", ephemeral=True)
 
