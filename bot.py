@@ -4,7 +4,6 @@ import json
 import re
 import asyncio
 import logging
-from urllib.parse import urlparse
 
 import discord
 from discord.ext import commands
@@ -13,7 +12,6 @@ from discord import app_commands
 # ========= 環境変数 =========
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # 必須（Railway Variables で設定）
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-# 複数ギルド可（カンマ区切り）。開発中はギルド同期を速くするため設定推奨
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "").split(",") if x.strip().isdigit()]
 
 # ========= ログ =========
@@ -61,7 +59,6 @@ async def kv_del(key: str):
             _kv_save(data)
 
 # ========= 権限/設定 =========
-# /board 配下コマンド & 承認ボタン操作を行えるユーザー
 ALLOWED_USER_IDS = {716667546241335328, 440893662701027328}
 
 def is_allowed_user(user: discord.abc.User) -> bool:
@@ -84,22 +81,11 @@ def gkey_panel(chid: int) -> str:   return PANEL_KEY.format(channel_id=chid)
 def gkey_counter(chid: int) -> str: return COUNTER_KEY.format(channel_id=chid)
 def gkey_logchan(chid: int) -> str: return LOGCHAN_KEY.format(channel_id=chid)
 def gkey_postmap(mid: int) -> str:  return POSTMAP_KEY.format(message_id=mid)
-def gkey_pending(log_mid: int) -> str:  return PENDING_KEY.format(log_msg_id=log_mid)
+def gkey_pending(log_mid: int) -> str:  return PENDING_KEY.format(message_id=log_mid)
 
-# ========= 画像URL検査 =========
+# ========= URL抽出 =========
 IMAGE_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|gif|webp)(?:\?.*)?$", re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-
-REQUIRE_IMAGE_WHITELIST = True
-SAFE_IMAGE_HOSTS = {
-    "cdn.discordapp.com", "media.discordapp.net",
-    "i.imgur.com", "imgur.com", "pbs.twimg.com", "images-ext-1.discordapp.net"
-}
-BLOCK_IMAGE_HOSTS = {
-    "rule34.xxx", "e621.net", "nhentai.net", "gelbooru.com", "danbooru.donmai.us",
-    "pornhub.com", "xvideos.com", "xhamster.com", "fapello.com", "redgifs.com",
-    "anonfiles.com", "pixeldrain.com"
-}
 
 def is_image_url(url: str) -> bool:
     if IMAGE_EXT_RE.search(url):
@@ -112,26 +98,6 @@ def extract_first_image_url(text: str) -> str | None:
         if is_image_url(m):
             return m
     return None
-
-def get_host(u: str) -> str | None:
-    try:
-        return urlparse(u).hostname
-    except Exception:
-        return None
-
-def is_safe_image_link(u: str) -> tuple[bool, str | None]:
-    if not u or not u.lower().startswith("https://"):
-        return (False, "画像URLは https:// で始まる必要があります。")
-    host = get_host(u)
-    if not host:
-        return (False, "URLの解析に失敗しました。")
-    if host in BLOCK_IMAGE_HOSTS:
-        return (False, f"このドメイン（{host}）からの画像は許可されていません。")
-    if REQUIRE_IMAGE_WHITELIST and host not in SAFE_IMAGE_HOSTS:
-        return (False, f"未許可のドメイン（{host}）です。許可ドメインのみアップロード可能です。")
-    if not is_image_url(u):
-        return (False, "画像URLではない可能性があります（拡張子やCDNが不明）。")
-    return (True, None)
 
 # ========= メッセージリンク解析 =========
 MSG_LINK_RE = re.compile(
@@ -162,7 +128,7 @@ tree = bot.tree
 
 # ========= UI =========
 class PostModal(discord.ui.Modal, title="投稿内容を入力"):
-    """画像付き: テキストを即時公開し、画像は承認後に追記。画像なし: 即時公開＋ログ送信。"""
+    """画像付き: 本文は即時公開・画像はログ承認後に追記。画像なし: 即時公開＋ログ記録。"""
     def __init__(self, channel_id: int, is_anonymous: bool):
         super().__init__(timeout=180)
         self.channel_id = channel_id
@@ -200,7 +166,7 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
         if not content:
             return await interaction.followup.send("本文が空です。", ephemeral=True)
 
-        # 画像URL抽出
+        # 画像URL抽出（判定はしない／承認に回す）
         img = (self.img_url.value or "").strip()
         if not img:
             img = extract_first_image_url(content) or ""
@@ -226,36 +192,30 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
         }
         await kv_set(gkey_postmap(published.id), json.dumps(post_info, ensure_ascii=False))
 
-        # 画像なし → ログに送る（設定がある場合）
+        # ログ先取得（画像なしもログ送信）
+        log_chan_id_s = await kv_get(gkey_logchan(self.channel_id))
+        log_ch = interaction.client.get_channel(int(log_chan_id_s)) if (log_chan_id_s and log_chan_id_s.isdigit()) else None
+
+        # 画像なし → ログに記録して終了
         if not has_image:
-            log_chan_id_s = await kv_get(gkey_logchan(self.channel_id))
-            if log_chan_id_s and log_chan_id_s.isdigit():
-                log_ch = interaction.client.get_channel(int(log_chan_id_s))
-                if isinstance(log_ch, discord.TextChannel):
-                    le = discord.Embed(
-                        title="📝 投稿ログ（画像なし）",
-                        description=content,
-                        color=discord.Color.dark_gray()
-                    )
-                    le.add_field(name="匿名？", value="はい" if self.is_anonymous else "いいえ", inline=True)
-                    le.add_field(name="表示名", value=display_name, inline=True)
-                    le.add_field(name="投稿先", value=f"<#{self.channel_id}>", inline=True)
-                    le.add_field(name="本文メッセージ", value=f"[ジャンプ]({published.jump_url})", inline=False)
-                    le.add_field(name="送信者", value=f"{interaction.user.mention} ({interaction.user.id})", inline=False)
-                    await log_ch.send(embed=le)
+            if isinstance(log_ch, discord.TextChannel):
+                le = discord.Embed(
+                    title="📝 投稿ログ（画像なし）",
+                    description=content,
+                    color=discord.Color.dark_gray()
+                )
+                le.add_field(name="匿名？", value="はい" if self.is_anonymous else "いいえ", inline=True)
+                le.add_field(name="表示名", value=display_name, inline=True)
+                le.add_field(name="投稿先", value=f"<#{self.channel_id}>", inline=True)
+                le.add_field(name="本文メッセージ", value=f"[ジャンプ]({published.jump_url})", inline=False)
+                le.add_field(name="送信者", value=f"{interaction.user.mention} ({interaction.user.id})", inline=False)
+                await log_ch.send(embed=le)
 
             await repost_panel(interaction.client, board_ch.id)
             return  # 成功時は無通知
 
-        # 画像あり → 安全チェック → 承認フロー
-        ok, reason = is_safe_image_link(img)
-        if not ok:
-            await interaction.followup.send(f"画像URLが許可されていません：{reason}", ephemeral=True)
-            await repost_panel(interaction.client, board_ch.id)
-            return
-
-        log_chan_id_s = await kv_get(gkey_logchan(self.channel_id))
-        if not (log_chan_id_s and log_chan_id_s.isdigit()):
+        # 画像あり → ログに承認カード（ドメイン判定なし・常に審査）
+        if not isinstance(log_ch, discord.TextChannel):
             await interaction.followup.send(
                 "画像は承認制ですが、ログチャンネルが未設定のため画像は反映できませんでした（本文は公開済み）。\n"
                 "管理者に /board setlog で設定してもらってください。",
@@ -264,16 +224,6 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
             await repost_panel(interaction.client, board_ch.id)
             return
 
-        log_ch = interaction.client.get_channel(int(log_chan_id_s))
-        if not isinstance(log_ch, discord.TextChannel):
-            await interaction.followup.send(
-                "ログチャンネルが見つからないため画像は反映できませんでした（本文は公開済み）。",
-                ephemeral=True
-            )
-            await repost_panel(interaction.client, board_ch.id)
-            return
-
-        # 承認待ちEmbed（ログ向け）
         pending = discord.Embed(
             title="🕒 画像承認リクエスト",
             description=content,
@@ -289,11 +239,10 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
         view = ApprovalView()
         log_msg = await log_ch.send(embed=pending, view=view)
 
-        # 承認待ち情報（ログ側メッセージIDをキー）
         pending_info = {
             "guild_id": interaction.guild_id,
             "board_channel_id": self.channel_id,
-            "board_message_id": published.id,     # ★ 承認時にこのメッセージへ画像を追記
+            "board_message_id": published.id,     # 承認時にこのメッセージへ画像を追記
             "log_message_id": log_msg.id,
             "anonymous": self.is_anonymous,
             "anon_display": display_name if self.is_anonymous else None,
@@ -340,13 +289,11 @@ class ApprovalView(discord.ui.View):
                 description=base.description or info["content"],
                 color=discord.Color.blurple()
             )
-            display_name = info["anon_display"] if info["anonymous"] else info["author_display"]
-            new_embed.set_footer(text=f"投稿者: {display_name}")
         else:
             new_embed = discord.Embed(description=info["content"], color=discord.Color.blurple())
-            display_name = info["anon_display"] if info["anonymous"] else info["author_display"]
-            new_embed.set_footer(text=f"投稿者: {display_name}")
 
+        display_name = info["anon_display"] if info["anonymous"] else info["author_display"]
+        new_embed.set_footer(text=f"投稿者: {display_name}")
         if info.get("img_url"):
             new_embed.set_image(url=info["img_url"])
 
@@ -383,7 +330,7 @@ class ApprovalView(discord.ui.View):
 
         # ログ側メッセージ更新＆ボタン無効化
         new_log_embed = interaction.message.embeds[0]
-        new_log_embed.title = "⛔ 却下（本文はそのまま公開）"
+        new_log_embed.title = "⛔ 実施せず（本文は公開済み）"
         new_log_embed.color = discord.Color.red()
         for child in self.children:
             child.disabled = True
