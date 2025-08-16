@@ -4,6 +4,7 @@ import json
 import re
 import asyncio
 import logging
+from urllib.parse import urlparse
 
 import discord
 from discord.ext import commands
@@ -22,7 +23,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# ========= 依存（簡易KV: JSON保存）=========
+# ========= 簡易KV(JSON) =========
 DB_PATH = "bot_kv.json"
 _db_lock = asyncio.Lock()
 
@@ -52,8 +53,15 @@ async def kv_get(key: str) -> str | None:
         data = _kv_load()
         return data.get(key)
 
-# ========= 匿名掲示板 構成 =========
-# /board 配下のコマンドを使えるユーザー（特定ユーザーのみ）
+async def kv_del(key: str):
+    async with _db_lock:
+        data = _kv_load()
+        if key in data:
+            del data[key]
+            _kv_save(data)
+
+# ========= 権限/設定 =========
+# /board 配下コマンド & 承認ボタン操作を行えるユーザー
 ALLOWED_USER_IDS = {716667546241335328, 440893662701027328}
 
 def is_allowed_user(user: discord.abc.User) -> bool:
@@ -65,25 +73,38 @@ async def guard_allowed(interaction: discord.Interaction) -> bool:
         return False
     return True
 
-# KVキー
-PANEL_KEY   = "anonboard:panel:{channel_id}"
-COUNTER_KEY = "anonboard:counter:{channel_id}"
-LOGCHAN_KEY = "anonboard:logchan:{channel_id}"
-POSTMAP_KEY = "anonboard:post:{message_id}"  # 投稿MsgID -> 投稿者情報(JSON)
+# ========= KVキー =========
+PANEL_KEY    = "anonboard:panel:{channel_id}"
+COUNTER_KEY  = "anonboard:counter:{channel_id}"
+LOGCHAN_KEY  = "anonboard:logchan:{channel_id}"
+POSTMAP_KEY  = "anonboard:post:{message_id}"   # 公開済みメッセージID -> 投稿者情報(JSON)
+PENDING_KEY  = "anonboard:pending:{message_id}"# 承認待ちログメッセージID -> 申請情報(JSON)
 
 def gkey_panel(chid: int) -> str:   return PANEL_KEY.format(channel_id=chid)
 def gkey_counter(chid: int) -> str: return COUNTER_KEY.format(channel_id=chid)
 def gkey_logchan(chid: int) -> str: return LOGCHAN_KEY.format(channel_id=chid)
 def gkey_postmap(mid: int) -> str:  return POSTMAP_KEY.format(message_id=mid)
+def gkey_pending(mid: int) -> str:  return PENDING_KEY.format(message_id=mid)
 
-# 画像URL抽出
+# ========= 画像URL検査 =========
 IMAGE_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|gif|webp)(?:\?.*)?$", re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+
+REQUIRE_IMAGE_WHITELIST = True  # True: ホワイトリスト外は弾く
+SAFE_IMAGE_HOSTS = {
+    "cdn.discordapp.com", "media.discordapp.net",
+    "i.imgur.com", "imgur.com", "pbs.twimg.com", "images-ext-1.discordapp.net"
+}
+BLOCK_IMAGE_HOSTS = {
+    "rule34.xxx", "e621.net", "nhentai.net", "gelbooru.com", "danbooru.donmai.us",
+    "pornhub.com", "xvideos.com", "xhamster.com", "fapello.com", "redgifs.com",
+    "anonfiles.com", "pixeldrain.com"
+}
 
 def is_image_url(url: str) -> bool:
     if IMAGE_EXT_RE.search(url):
         return True
-    cdn_like = ("cdn.discordapp.com", "media.discordapp.net", "images-ext", "pbs.twimg.com")
+    cdn_like = ("cdn.discordapp.com", "media.discordapp.net", "images-ext", "pbs.twimg.com", "imgur.com")
     return any(h in url for h in cdn_like)
 
 def extract_first_image_url(text: str) -> str | None:
@@ -92,7 +113,27 @@ def extract_first_image_url(text: str) -> str | None:
             return m
     return None
 
-# メッセージリンク → message 取得
+def get_host(u: str) -> str | None:
+    try:
+        return urlparse(u).hostname
+    except Exception:
+        return None
+
+def is_safe_image_link(u: str) -> tuple[bool, str | None]:
+    if not u or not u.lower().startswith("https://"):
+        return (False, "画像URLは https:// で始まる必要があります。")
+    host = get_host(u)
+    if not host:
+        return (False, "URLの解析に失敗しました。")
+    if host in BLOCK_IMAGE_HOSTS:
+        return (False, f"このドメイン（{host}）からの画像は許可されていません。")
+    if REQUIRE_IMAGE_WHITELIST and host not in SAFE_IMAGE_HOSTS:
+        return (False, f"未許可のドメイン（{host}）です。許可ドメインのみアップロード可能です。")
+    if not is_image_url(u):
+        return (False, "画像URLではない可能性があります（拡張子やCDNが不明）。")
+    return (True, None)
+
+# ========= メッセージリンク解析 =========
 MSG_LINK_RE = re.compile(
     r"https?://(?:ptb\.|canary\.)?discord\.com/channels/(?P<guild_id>\d+)/(?P<channel_id>\d+)/(?P<message_id>\d+)"
 )
@@ -113,14 +154,15 @@ async def fetch_message_from_link(bot: commands.Bot, link: str) -> discord.Messa
 
 # ========= Discord =========
 intents = discord.Intents.default()
-intents.message_content = True  # モーダル本文等の反応に必要
+intents.message_content = True
 intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ---- 匿名掲示板 UI ----
+# ========= UI =========
 class PostModal(discord.ui.Modal, title="投稿内容を入力"):
+    """送信：テキストは即時公開。画像付きは承認制（ログに投げてからApproveで公開）"""
     def __init__(self, channel_id: int, is_anonymous: bool):
         super().__init__(timeout=180)
         self.channel_id = channel_id
@@ -131,17 +173,20 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
         )
         self.add_item(self.content)
         self.img_url = discord.ui.TextInput(
-            label="画像URL（任意）", style=discord.TextStyle.short,
+            label="画像URL（任意・画像は承認制）", style=discord.TextStyle.short,
             placeholder="https://...", max_length=500, required=False
         )
         self.add_item(self.img_url)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # 成功時は無通知にするため、まずdefer
+        await interaction.response.defer(ephemeral=True, thinking=False)
+
         channel = interaction.client.get_channel(self.channel_id)
         if channel is None or not isinstance(channel, discord.TextChannel):
-            return await interaction.response.send_message("対象チャンネルが見つかりません。", ephemeral=True)
+            return await interaction.followup.send("対象チャンネルが見つかりません。", ephemeral=True)
 
-        # 表示名
+        # 表示名（匿名は連番）
         if self.is_anonymous:
             counter_s = await kv_get(gkey_counter(self.channel_id))
             counter = int(counter_s) if counter_s and counter_s.isdigit() else 0
@@ -153,22 +198,87 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
 
         content = self.content.value.strip()
         if not content:
-            return await interaction.response.send_message("本文が空です。", ephemeral=True)
+            return await interaction.followup.send("本文が空です。", ephemeral=True)
 
+        # 画像URL抽出 & 安全チェック
         img = (self.img_url.value or "").strip()
         if not img:
             img = extract_first_image_url(content) or ""
-        if img and not is_image_url(img):
-            img = ""
+        img = img.strip()
+        has_image = bool(img)
 
+        if has_image:
+            ok, reason = is_safe_image_link(img)
+            if not ok:
+                # ログ通報（あれば）＆投稿者に理由を返す
+                log_chan_id_s = await kv_get(gkey_logchan(self.channel_id))
+                if log_chan_id_s and log_chan_id_s.isdigit():
+                    log_chan = interaction.client.get_channel(int(log_chan_id_s))
+                    if isinstance(log_chan, discord.TextChannel):
+                        warn = discord.Embed(
+                            title="❗ブロックされた画像URL",
+                            description=content or "(本文なし)",
+                            color=discord.Color.red()
+                        )
+                        warn.add_field(name="理由", value=reason, inline=False)
+                        warn.add_field(name="送信者", value=f"{interaction.user.mention} ({interaction.user.id})", inline=False)
+                        warn.add_field(name="URL", value=img, inline=False)
+                        await log_chan.send(embed=warn)
+                return await interaction.followup.send(f"画像URLが許可されていません：{reason}", ephemeral=True)
+
+        # 画像あり → 承認制（ログへ投げる）
+        if has_image:
+            log_chan_id_s = await kv_get(gkey_logchan(self.channel_id))
+            if not (log_chan_id_s and log_chan_id_s.isdigit()):
+                return await interaction.followup.send(
+                    "この掲示板では画像は承認制ですが、ログチャンネルが未設定のため投稿できません。\n"
+                    "管理者に /board setlog で設定してもらってください。",
+                    ephemeral=True
+                )
+
+            log_chan = interaction.client.get_channel(int(log_chan_id_s))
+            if not isinstance(log_chan, discord.TextChannel):
+                return await interaction.followup.send("ログチャンネルが見つかりません。", ephemeral=True)
+
+            # 承認待ちEmbed（ログ向け）
+            pending = discord.Embed(
+                title="🕒 画像付き投稿（承認待ち）",
+                description=content,
+                color=discord.Color.orange()
+            )
+            pending.add_field(name="匿名？", value="はい" if self.is_anonymous else "いいえ", inline=True)
+            pending.add_field(name="表示名", value=display_name, inline=True)
+            pending.add_field(name="投稿先", value=f"<#{self.channel_id}>", inline=False)
+            pending.add_field(name="送信者", value=f"{interaction.user.mention} ({interaction.user.id})", inline=False)
+            pending.set_image(url=img)
+
+            view = ApprovalView()  # 下で定義
+            sent = await log_chan.send(embed=pending, view=view)
+
+            # 承認待ち情報保存（キーはログ側メッセージID）
+            info = {
+                "guild_id": interaction.guild_id,
+                "board_channel_id": self.channel_id,
+                "log_message_id": sent.id,
+                "anonymous": self.is_anonymous,
+                "anon_display": display_name if self.is_anonymous else None,
+                "author_id": interaction.user.id,
+                "author_name": str(interaction.user),
+                "author_display": interaction.user.display_name,
+                "content": content,
+                "img_url": img
+            }
+            await kv_set(gkey_pending(sent.id), json.dumps(info, ensure_ascii=False))
+
+            # 成功時は無通知（returnのみ）
+            return
+
+        # 画像なし → 即時公開
         embed = discord.Embed(description=content, color=discord.Color.blurple())
         embed.set_footer(text=f"投稿者: {display_name}")
-        if img:
-            embed.set_image(url=img)
-
         sent = await channel.send(embed=embed)
 
-        # 投稿マップ保存
+        # 公開マッピング保存（reveal用）
         post_info = {
             "guild_id": interaction.guild_id,
             "channel_id": self.channel_id,
@@ -178,27 +288,90 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
             "author_id": interaction.user.id,
             "author_name": str(interaction.user),
             "author_display": interaction.user.display_name,
-            "img_url": img or None,
+            "img_url": None,
         }
         await kv_set(gkey_postmap(sent.id), json.dumps(post_info, ensure_ascii=False))
 
-        # ログチャンネルへ（任意）
-        log_chan_id_s = await kv_get(gkey_logchan(self.channel_id))
-        if log_chan_id_s and log_chan_id_s.isdigit():
-            log_chan = interaction.client.get_channel(int(log_chan_id_s))
-            if isinstance(log_chan, discord.TextChannel):
-                le = discord.Embed(
-                    title="匿名掲示板 投稿ログ", description=content, color=discord.Color.dark_gray()
-                )
-                le.add_field(name="匿名？", value="はい" if self.is_anonymous else "いいえ", inline=True)
-                le.add_field(name="表示名", value=display_name, inline=True)
-                le.add_field(name="実投稿者", value=f"{interaction.user.mention} ({interaction.user.id})", inline=False)
-                le.add_field(name="メッセージ", value=f"[ジャンプ]({sent.jump_url})", inline=False)
-                if img: le.set_image(url=img)
-                await log_chan.send(embed=le)
+        await repost_panel(interaction.client, channel.id)
+        # 成功時は無通知
+        return
 
-        await repost_panel(interaction.client, channel.id)  # 最下部固定
-        await interaction.response.send_message("投稿しました。", ephemeral=True)
+class ApprovalView(discord.ui.View):
+    """ログチャンネルに出す承認UI（特定ユーザーのみ操作可）"""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed_user(interaction.user):
+            return await interaction.response.send_message("承認権限がありません。", ephemeral=True)
+
+        pending_s = await kv_get(gkey_pending(interaction.message.id))
+        if not pending_s:
+            return await interaction.response.send_message("承認待ち情報が見つかりません。", ephemeral=True)
+
+        info = json.loads(pending_s)
+        board_ch = interaction.client.get_channel(int(info["board_channel_id"]))
+        if not isinstance(board_ch, discord.TextChannel):
+            return await interaction.response.send_message("投稿先チャンネルが見つかりません。", ephemeral=True)
+
+        # 公開用Embed
+        content = info["content"]
+        display_name = info["anon_display"] if info["anonymous"] else info["author_display"]
+        embed = discord.Embed(description=content, color=discord.Color.blurple())
+        embed.set_footer(text=f"投稿者: {display_name}")
+        if info.get("img_url"):
+            embed.set_image(url=info["img_url"])
+
+        published = await board_ch.send(embed=embed)
+
+        # 公開マッピング保存（reveal用）
+        post_info = {
+            "guild_id": info["guild_id"],
+            "channel_id": info["board_channel_id"],
+            "message_id": published.id,
+            "anonymous": info["anonymous"],
+            "anon_display": info.get("anon_display"),
+            "author_id": info["author_id"],
+            "author_name": info["author_name"],
+            "author_display": info["author_display"],
+            "img_url": info.get("img_url")
+        }
+        await kv_set(gkey_postmap(published.id), json.dumps(post_info, ensure_ascii=False))
+        await kv_del(gkey_pending(interaction.message.id))
+
+        # ログ側メッセージを更新（承認済み・ボタン無効化）
+        new_embed = interaction.message.embeds[0]
+        new_embed.title = "✅ 公開済み（承認）"
+        new_embed.color = discord.Color.green()
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(embed=new_embed, view=self)
+
+        await repost_panel(interaction.client, int(info["board_channel_id"]))
+        await interaction.response.send_message("承認しました。", ephemeral=True)
+
+    @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="🛑")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_allowed_user(interaction.user):
+            return await interaction.response.send_message("承認権限がありません。", ephemeral=True)
+
+        pending_s = await kv_get(gkey_pending(interaction.message.id))
+        if not pending_s:
+            return await interaction.response.send_message("承認待ち情報が見つかりません。", ephemeral=True)
+
+        info = json.loads(pending_s)
+        await kv_del(gkey_pending(interaction.message.id))
+
+        # ログ側メッセージを更新（却下・ボタン無効化）
+        new_embed = interaction.message.embeds[0]
+        new_embed.title = "⛔ 却下"
+        new_embed.color = discord.Color.red()
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(embed=new_embed, view=self)
+
+        await interaction.response.send_message("却下しました。", ephemeral=True)
 
 class BoardView(discord.ui.View):
     def __init__(self, channel_id: int):
@@ -236,7 +409,6 @@ async def repost_panel(client: commands.Bot, channel_id: int):
 # ---- スラッシュグループ ----
 board_group = app_commands.Group(name="board", description="匿名掲示板の設定/操作")
 
-# ギルド同期用デコレータ
 def guild_deco(func):
     if GUILD_IDS:
         return app_commands.guilds(*[discord.Object(id=g) for g in GUILD_IDS])(func)
@@ -247,7 +419,7 @@ def guild_deco(func):
 @app_commands.describe(
     channel="掲示板にするテキストチャンネル（未指定ならこのチャンネル）",
     reset_counter="匿名連番を0から再開",
-    log_channel="投稿ログ送信先（任意）"
+    log_channel="投稿ログ送信先（画像承認用・必須推奨）"
 )
 async def board_setup(
     interaction: discord.Interaction,
@@ -269,11 +441,11 @@ async def board_setup(
 
     await repost_panel(interaction.client, target.id)
     txt = f"掲示板パネルを設置しました：{target.mention}\n"
-    if log_channel: txt += f"投稿ログ：{log_channel.mention}\n"
+    if log_channel: txt += f"投稿ログ（承認用）：{log_channel.mention}\n"
     if reset_counter: txt += "匿名連番をリセットしました。"
     await interaction.response.send_message(txt, ephemeral=True)
 
-@board_group.command(name="setlog", description="掲示板の投稿ログ先を設定")
+@board_group.command(name="setlog", description="掲示板の投稿ログ先を設定（画像承認用）")
 @guild_deco
 @app_commands.describe(board_channel="掲示板チャンネル（未指定なら実行場所）", log_channel="ログ送信先")
 async def board_setlog(
@@ -349,9 +521,9 @@ async def on_ready():
     user_info = "(user: None)" if bot.user is None else f"{bot.user} (ID: {bot.user.id})"
     log.info(f"Logged in as {user_info}")
     try:
+        # コマンドグループ登録
         if board_group not in tree.get_commands():
             tree.add_command(board_group)
-
         # ギルド同期（即時反映）
         if GUILD_IDS:
             for gid in GUILD_IDS:
