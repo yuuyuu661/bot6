@@ -17,7 +17,7 @@ GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "").split(",") if x.
 # ========= ログ =========
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="(%(asctime)s) [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("bot")
 
@@ -74,9 +74,20 @@ async def guard_allowed(interaction: discord.Interaction) -> bool:
 PANEL_KEY    = "anonboard:panel:{channel_id}"
 COUNTER_KEY  = "anonboard:counter:{channel_id}"
 LOGCHAN_KEY  = "anonboard:logchan:{channel_id}"
-POSTMAP_KEY  = "anonboard:post:{message_id}"    # 公開メッセージID -> 投稿者情報(JSON)
-# 承認待ちログメッセージID -> 申請情報(JSON)
-PENDING_KEY  = "anonboard:pending:{log_msg_id}"
+POSTMAP_KEY  = "anonboard:post:{message_id}"     # 公開メッセージID -> 投稿者情報(JSON)
+PENDING_KEY  = "anonboard:pending:{log_msg_id}"  # 承認待ちログメッセージID -> 申請情報(JSON)
+
+def gkey_panel(chid: int) -> str:
+    return PANEL_KEY.format(channel_id=chid)
+
+def gkey_counter(chid: int) -> str:
+    return COUNTER_KEY.format(channel_id=chid)
+
+def gkey_logchan(chid: int) -> str:
+    return LOGCHAN_KEY.format(channel_id=chid)
+
+def gkey_postmap(mid: int) -> str:
+    return POSTMAP_KEY.format(message_id=mid)
 
 def gkey_pending(log_mid: int) -> str:
     return PENDING_KEY.format(log_msg_id=log_mid)
@@ -85,10 +96,6 @@ def gkey_pending(log_mid: int) -> str:
 PENDING_KEY_LEGACY = "anonboard:pending:{message_id}"
 def gkey_pending_legacy(log_mid: int) -> str:
     return PENDING_KEY_LEGACY.format(message_id=log_mid)
-def gkey_counter(chid: int) -> str: return COUNTER_KEY.format(channel_id=chid)
-def gkey_logchan(chid: int) -> str: return LOGCHAN_KEY.format(channel_id=chid)
-def gkey_postmap(mid: int) -> str:  return POSTMAP_KEY.format(message_id=mid)
-def gkey_pending(log_mid: int) -> str:  return PENDING_KEY.format(message_id=log_mid)
 
 # ========= URL抽出 =========
 IMAGE_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|gif|webp)(?:\?.*)?$", re.IGNORECASE)
@@ -274,14 +281,13 @@ class ApprovalView(discord.ui.View):
         if not is_allowed_user(interaction.user):
             return await interaction.response.send_message("承認権限がありません。", ephemeral=True)
 
+        # 新→旧の順で検索し、旧が見つかれば新へ移行
         pending_s = await kv_get(gkey_pending(interaction.message.id))
         if not pending_s:
-        # 後方互換キーでも検索
-        pending_s = await kv_get(gkey_pending_legacy(interaction.message.id))
-        if pending_s:
-            # 見つかったら新キーへ移行しておく（任意だが推奨）
-            await kv_set(gkey_pending(interaction.message.id), pending_s)
-            await kv_del(gkey_pending_legacy(interaction.message.id))
+            pending_s = await kv_get(gkey_pending_legacy(interaction.message.id))
+            if pending_s:
+                await kv_set(gkey_pending(interaction.message.id), pending_s)
+                await kv_del(gkey_pending_legacy(interaction.message.id))
 
         if not pending_s:
             return await interaction.response.send_message("承認待ち情報が見つかりません。", ephemeral=True)
@@ -329,8 +335,10 @@ class ApprovalView(discord.ui.View):
             child.disabled = True
         await interaction.message.edit(embed=new_log_embed, view=self)
 
+        # 承認待ちレコード掃除（新旧両方）
         await kv_del(gkey_pending(interaction.message.id))
-        await kv_del(gkey_pending_legacy(interaction.message.id))  # 念のため旧書式も削除
+        await kv_del(gkey_pending_legacy(interaction.message.id))
+
         await interaction.response.send_message("承認して掲示板に画像を反映しました。", ephemeral=True)
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="🛑")
@@ -338,20 +346,28 @@ class ApprovalView(discord.ui.View):
         if not is_allowed_user(interaction.user):
             return await interaction.response.send_message("承認権限がありません。", ephemeral=True)
 
+        # 新→旧の順で検索し、旧が見つかれば新へ移行
         pending_s = await kv_get(gkey_pending(interaction.message.id))
+        if not pending_s:
+            pending_s = await kv_get(gkey_pending_legacy(interaction.message.id))
+            if pending_s:
+                await kv_set(gkey_pending(interaction.message.id), pending_s)
+                await kv_del(gkey_pending_legacy(interaction.message.id))
+
         if not pending_s:
             return await interaction.response.send_message("承認待ち情報が見つかりません。", ephemeral=True)
 
-        await kv_del(gkey_pending(interaction.message.id))
-        await kv_del(gkey_pending_legacy(interaction.message.id))  # 念のため旧書式も削除
-
-        # ログ側メッセージ更新＆ボタン無効化
+        # ログ側メッセージ更新＆ボタン無効化（本文は既に公開済みのまま）
         new_log_embed = interaction.message.embeds[0]
         new_log_embed.title = "⛔ 実施せず（本文は公開済み）"
         new_log_embed.color = discord.Color.red()
         for child in self.children:
             child.disabled = True
         await interaction.message.edit(embed=new_log_embed, view=self)
+
+        # 承認待ちレコード掃除（新旧両方）
+        await kv_del(gkey_pending(interaction.message.id))
+        await kv_del(gkey_pending_legacy(interaction.message.id))
 
         await interaction.response.send_message("却下しました（本文は公開済みのまま）。", ephemeral=True)
 
@@ -518,9 +534,8 @@ async def on_ready():
 def main():
     if not DISCORD_TOKEN:
         log.error("DISCORD_TOKEN が未設定です（Railway Variables で設定してください）")
-        sys.exit(1)
-    bot.run(DISCORD_TOKEN)
+    else:
+        bot.run(DISCORD_TOKEN)
 
 if __name__ == "__main__":
     main()
-
