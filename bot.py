@@ -331,9 +331,7 @@ async def board_reveal(interaction: discord.Interaction, message_link: str):
 
 # ---- /ping ----
 @tree.command(name="ping", description="生存確認")
-def _guild_wrap(func):
-    return guild_deco(func)
-@_guild_wrap
+@guild_deco
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong! 🏓", ephemeral=True)
 
@@ -367,3 +365,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
