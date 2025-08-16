@@ -75,9 +75,16 @@ PANEL_KEY    = "anonboard:panel:{channel_id}"
 COUNTER_KEY  = "anonboard:counter:{channel_id}"
 LOGCHAN_KEY  = "anonboard:logchan:{channel_id}"
 POSTMAP_KEY  = "anonboard:post:{message_id}"    # 公開メッセージID -> 投稿者情報(JSON)
-PENDING_KEY  = "anonboard:pending:{log_msg_id}" # 承認待ちログメッセージID -> 申請情報(JSON)
+# 承認待ちログメッセージID -> 申請情報(JSON)
+PENDING_KEY  = "anonboard:pending:{log_msg_id}"
 
-def gkey_panel(chid: int) -> str:   return PANEL_KEY.format(channel_id=chid)
+def gkey_pending(log_mid: int) -> str:
+    return PENDING_KEY.format(log_msg_id=log_mid)
+
+# （後方互換）昔のコードで {message_id} を使っていた場合に備える
+PENDING_KEY_LEGACY = "anonboard:pending:{message_id}"
+def gkey_pending_legacy(log_mid: int) -> str:
+    return PENDING_KEY_LEGACY.format(message_id=log_mid)
 def gkey_counter(chid: int) -> str: return COUNTER_KEY.format(channel_id=chid)
 def gkey_logchan(chid: int) -> str: return LOGCHAN_KEY.format(channel_id=chid)
 def gkey_postmap(mid: int) -> str:  return POSTMAP_KEY.format(message_id=mid)
@@ -269,6 +276,14 @@ class ApprovalView(discord.ui.View):
 
         pending_s = await kv_get(gkey_pending(interaction.message.id))
         if not pending_s:
+        # 後方互換キーでも検索
+        pending_s = await kv_get(gkey_pending_legacy(interaction.message.id))
+        if pending_s:
+            # 見つかったら新キーへ移行しておく（任意だが推奨）
+            await kv_set(gkey_pending(interaction.message.id), pending_s)
+            await kv_del(gkey_pending_legacy(interaction.message.id))
+
+        if not pending_s:
             return await interaction.response.send_message("承認待ち情報が見つかりません。", ephemeral=True)
 
         info = json.loads(pending_s)
@@ -315,6 +330,7 @@ class ApprovalView(discord.ui.View):
         await interaction.message.edit(embed=new_log_embed, view=self)
 
         await kv_del(gkey_pending(interaction.message.id))
+        await kv_del(gkey_pending_legacy(interaction.message.id))  # 念のため旧書式も削除
         await interaction.response.send_message("承認して掲示板に画像を反映しました。", ephemeral=True)
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="🛑")
@@ -327,6 +343,7 @@ class ApprovalView(discord.ui.View):
             return await interaction.response.send_message("承認待ち情報が見つかりません。", ephemeral=True)
 
         await kv_del(gkey_pending(interaction.message.id))
+        await kv_del(gkey_pending_legacy(interaction.message.id))  # 念のため旧書式も削除
 
         # ログ側メッセージ更新＆ボタン無効化
         new_log_embed = interaction.message.embeds[0]
@@ -506,3 +523,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
