@@ -13,7 +13,9 @@ from discord import app_commands
 # ========= 環境変数 =========
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # 必須（Railway Variables で設定）
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "").split(",") if x.strip().isdigit()]
+# 即時反映用：ギルド同期対象（カンマ区切りOK）
+GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "1398607685158440991").split(",") if x.strip().isdigit()]
+PRIMARY_GUILD_ID = GUILD_IDS[0] if GUILD_IDS else 1398607685158440991
 
 # ========= ログ =========
 logging.basicConfig(
@@ -60,7 +62,6 @@ async def kv_del(key: str):
             _kv_save(data)
 
 async def kv_all() -> dict:
-    # 全キー取得（定期削除設定の復元に利用）
     async with _db_lock:
         return _kv_load()
 
@@ -93,7 +94,7 @@ def gkey_pending(log_mid: int) -> str:  return PENDING_KEY.format(log_msg_id=log
 def gkey_autodel(chid: int) -> str:     return AUTODEL_KEY.format(channel_id=chid)
 def gkey_autoclear(chid: int) -> str:   return AUTOCLEAR_KEY.format(channel_id=chid)
 
-# （後方互換）昔のコードで {message_id} を使っていた場合に備える
+# （後方互換）
 PENDING_KEY_LEGACY = "anonboard:pending:{message_id}"
 def gkey_pending_legacy(log_mid: int) -> str:
     return PENDING_KEY_LEGACY.format(message_id=log_mid)
@@ -141,7 +142,7 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ========= 匿名掲示板 UI =========
+# ========= 匿名掲示板 =========
 class PostModal(discord.ui.Modal, title="投稿内容を入力"):
     """画像付き: 本文は即時公開・画像はログ承認後に追記。画像なし: 即時公開＋ログ記録。"""
     def __init__(self, channel_id: int, is_anonymous: bool):
@@ -180,7 +181,7 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
         if not content:
             return await interaction.followup.send("本文が空です。", ephemeral=True)
 
-        # 画像URL抽出（承認フローへ）
+        # 画像URL抽出（承認フローに回す）
         img = (self.img_url.value or "").strip()
         if not img:
             img = extract_first_image_url(content) or ""
@@ -206,7 +207,7 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
         }
         await kv_set(gkey_postmap(published.id), json.dumps(post_info, ensure_ascii=False))
 
-        # ログ送信
+        # ログ送信（画像なしでも送る）
         log_chan_id_s = await kv_get(gkey_logchan(self.channel_id))
         log_ch = interaction.client.get_channel(int(log_chan_id_s)) if (log_chan_id_s and log_chan_id_s.isdigit()) else None
 
@@ -222,6 +223,7 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
             await repost_panel(interaction.client, board_ch.id)
             return
 
+        # 画像あり → 承認カード
         if not isinstance(log_ch, discord.TextChannel):
             await interaction.followup.send(
                 "画像は承認制ですが、ログチャンネルが未設定のため画像は反映できませんでした（本文は公開済み）。\n"
@@ -479,23 +481,19 @@ async def board_autodel_stop(interaction: discord.Interaction):
     await kv_del(gkey_autodel(interaction.channel_id))
     await interaction.response.send_message("このチャンネルの自動削除を **停止** しました。", ephemeral=True)
 
-# ========= 定期的な履歴自動削除 =========
+# ========= 定期的な履歴自動削除（autoclear） =========
 _autoclear_tasks: dict[int, asyncio.Task] = {}
 
 async def _run_autoclear(channel: discord.TextChannel, interval_sec: int, keep_hours: int, batch_limit: int):
-    # 注意: bulk delete は Discord の仕様で「14日以内」のメッセージに限られる
     while True:
         try:
             await asyncio.sleep(interval_sec)
             cutoff = discord.utils.utcnow() - datetime.timedelta(hours=keep_hours)
 
-            # 掲示板パネルは除外
             panel_id_s = await kv_get(gkey_panel(channel.id))
             panel_id = int(panel_id_s) if (panel_id_s and panel_id_s.isdigit()) else None
 
-            # 直近から走査して、古いものだけを削除
-            to_delete_bulk = []
-            to_delete_single = []
+            to_delete_bulk, to_delete_single = [], []
             async for msg in channel.history(limit=1000, oldest_first=False):
                 if len(to_delete_bulk) + len(to_delete_single) >= batch_limit:
                     break
@@ -505,26 +503,21 @@ async def _run_autoclear(channel: discord.TextChannel, interval_sec: int, keep_h
                     continue
                 if msg.created_at >= cutoff:
                     continue
-
-                # 14日判定
+                # 14日以内はbulk、超えは個別
                 if (discord.utils.utcnow() - msg.created_at) <= datetime.timedelta(days=14):
                     to_delete_bulk.append(msg)
                 else:
                     to_delete_single.append(msg)
 
-            # まとめて削除（14日以内）
             if to_delete_bulk:
                 try:
                     await channel.delete_messages(to_delete_bulk)
                 except Exception:
-                    # フォールバック：個別削除
                     for m in to_delete_bulk:
                         try:
                             await m.delete()
                         except Exception:
                             pass
-
-            # 14日超は個別削除
             for m in to_delete_single:
                 try:
                     await m.delete()
@@ -532,23 +525,21 @@ async def _run_autoclear(channel: discord.TextChannel, interval_sec: int, keep_h
                     pass
 
             if to_delete_bulk or to_delete_single:
-                log.info(f"[autoclear] channel={channel.id} deleted bulk={len(to_delete_bulk)} single={len(to_delete_single)} (cutoff={cutoff.isoformat()})")
+                log.info(f"[autoclear] channel={channel.id} deleted bulk={len(to_delete_bulk)} single={len(to_delete_single)} (<{keep_hours}h)")
 
         except asyncio.CancelledError:
             break
         except Exception as e:
             log.exception(f"[autoclear] error in channel {channel.id}: {e}")
-            # 失敗時も次周期でリトライ
             continue
 
 async def start_autoclear_for_channel(bot: commands.Bot, channel_id: int, interval_sec: int, keep_hours: int, batch_limit: int):
-    # 既存タスク停止
     await stop_autoclear_for_channel(channel_id)
     ch = bot.get_channel(channel_id)
     if not isinstance(ch, discord.TextChannel):
         return
-    task = asyncio.create_task(_run_autoclear(ch, interval_sec, keep_hours, batch_limit))
-    _autoclear_tasks[channel_id] = task
+    t = asyncio.create_task(_run_autoclear(ch, interval_sec, keep_hours, batch_limit))
+    _autoclear_tasks[channel_id] = t
 
 async def stop_autoclear_for_channel(channel_id: int):
     t = _autoclear_tasks.pop(channel_id, None)
@@ -563,7 +554,7 @@ async def stop_autoclear_for_channel(channel_id: int):
 @app_commands.describe(
     interval_seconds="実行間隔（60〜86400秒）",
     keep_hours="保存期間（1〜720時間：これより古いメッセージを削除）",
-    batch_limit="1回での最大削除数（10〜1000、既定200）"
+    batch_limit="1回の最大削除数（10〜1000、既定200）"
 )
 async def board_autoclear_start(
     interaction: discord.Interaction,
@@ -573,7 +564,6 @@ async def board_autoclear_start(
 ):
     if not await guard_allowed(interaction):
         return
-    # 権限チェック（ボット側）
     me = interaction.guild.me if interaction.guild else None
     if not (me and interaction.channel.permissions_for(me).manage_messages):
         return await interaction.response.send_message("ボットに **メッセージの管理** 権限が必要です。", ephemeral=True)
@@ -582,10 +572,7 @@ async def board_autoclear_start(
     await kv_set(gkey_autoclear(interaction.channel_id), json.dumps(cfg, ensure_ascii=False))
     await start_autoclear_for_channel(interaction.client, interaction.channel_id, cfg["interval"], cfg["keep_hours"], cfg["batch_limit"])
     await interaction.response.send_message(
-        f"✅ 定期削除を開始しました。\n"
-        f"- 実行間隔: **{cfg['interval']}秒**\n"
-        f"- 保存期間: **{cfg['keep_hours']}時間**（これより古いメッセージを削除）\n"
-        f"- 1回の上限: **{cfg['batch_limit']}件**",
+        f"✅ 定期削除を開始しました。\n- 実行間隔: **{cfg['interval']}秒**\n- 保存期間: **{cfg['keep_hours']}時間**\n- 1回の上限: **{cfg['batch_limit']}件**",
         ephemeral=True
     )
 
@@ -597,9 +584,34 @@ async def board_autoclear_stop(interaction: discord.Interaction):
     await stop_autoclear_for_channel(interaction.channel_id)
     await interaction.response.send_message("⏹️ 定期削除を停止しました。", ephemeral=True)
 
+# ---- トップレベルのギルド専用ショートコマンド（即時反映） ----
+def guild_only_deco(func):
+    return app_commands.guilds(discord.Object(id=PRIMARY_GUILD_ID))(func)
+
+@tree.command(name="purge_start", description="（ショート）一定間隔で古い履歴を自動削除",)
+@guild_only_deco
+@app_commands.describe(
+    interval_seconds="実行間隔（60〜86400秒）",
+    keep_hours="保存期間（1〜720時間）",
+    batch_limit="1回の最大削除数（10〜1000、既定200）"
+)
+async def purge_start(
+    interaction: discord.Interaction,
+    interval_seconds: app_commands.Range[int, 60, 86400],
+    keep_hours: app_commands.Range[int, 1, 720],
+    batch_limit: app_commands.Range[int, 10, 1000] = 200
+):
+    # /board autoclear_start の糖衣
+    await board_autoclear_start.callback(interaction, interval_seconds, keep_hours, batch_limit)  # type: ignore
+
+@tree.command(name="purge_stop", description="（ショート）自動履歴削除を停止")
+@guild_only_deco
+async def purge_stop(interaction: discord.Interaction):
+    await board_autoclear_stop.callback(interaction)  # type: ignore
+
 # ---- /ping ----
 @tree.command(name="ping", description="生存確認")
-@guild_deco  # 付けても外してもOK
+@guild_only_deco
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong! 🏓", ephemeral=True)
 
@@ -612,7 +624,6 @@ async def on_message(message: discord.Message):
     if message.author is None:
         return
 
-    # 新規メッセージの自動削除（autodel）
     sec_s = await kv_get(gkey_autodel(message.channel.id))
     if not sec_s:
         return
@@ -646,17 +657,14 @@ async def on_ready():
     try:
         if board_group not in tree.get_commands():
             tree.add_command(board_group)
-        if GUILD_IDS:
-            for gid in GUILD_IDS:
-                await tree.sync(guild=discord.Object(id=gid))
-                log.info(f"Synced commands to guild {gid}")
-        else:
-            await tree.sync()
-            log.info("Synced global commands")
+        # ★ ギルド同期（即時反映）
+        for gid in GUILD_IDS:
+            await tree.sync(guild=discord.Object(id=gid))
+            log.info(f"Synced commands to guild {gid}")
     except Exception as e:
         log.exception("Command sync failed: %s", e)
 
-    # ---- 起動時に定期削除タスクを復元 ----
+    # 起動時に定期削除タスクを復元
     try:
         allkv = await kv_all()
         prefix = "anonboard:autoclear:"
@@ -680,8 +688,8 @@ async def on_ready():
 def main():
     if not DISCORD_TOKEN:
         log.error("DISCORD_TOKEN が未設定です（Railway Variables で設定してください）")
-    else:
-        bot.run(DISCORD_TOKEN)
+        sys.exit(1)
+    bot.run(DISCORD_TOKEN)
 
 if __name__ == "__main__":
     main()
