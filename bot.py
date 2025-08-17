@@ -13,7 +13,7 @@ from discord import app_commands
 # ========= 環境変数 =========
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # 必須（Railway Variables で設定）
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-# 即時反映用：ギルド同期対象（カンマ区切りOK）
+# ギルド即時反映用：複数サーバならカンマ区切りで指定可。未設定なら例のIDを既定値に。
 GUILD_IDS = [int(x.strip()) for x in os.getenv("GUILD_IDS", "1398607685158440991").split(",") if x.strip().isdigit()]
 PRIMARY_GUILD_ID = GUILD_IDS[0] if GUILD_IDS else 1398607685158440991
 
@@ -77,14 +77,13 @@ async def guard_allowed(interaction: discord.Interaction) -> bool:
         return False
     return True
 
-# ========= KVキー =========
+# ========= 掲示板用 KVキー =========
 PANEL_KEY    = "anonboard:panel:{channel_id}"
 COUNTER_KEY  = "anonboard:counter:{channel_id}"
 LOGCHAN_KEY  = "anonboard:logchan:{channel_id}"
 POSTMAP_KEY  = "anonboard:post:{message_id}"      # 公開メッセージID -> 投稿者情報(JSON)
 PENDING_KEY  = "anonboard:pending:{log_msg_id}"   # 承認待ちログメッセージID -> 申請情報(JSON)
-AUTODEL_KEY  = "anonboard:autodel_sec:{channel_id}"       # 送信後◯秒で削除（新規のみ）
-AUTOCLEAR_KEY= "anonboard:autoclear:{channel_id}"         # 定期履歴削除の設定(JSON)
+AUTODEL_KEY  = "anonboard:autodel_sec:{channel_id}"  # 送信後◯秒削除（新規のみ）
 
 def gkey_panel(chid: int) -> str:       return PANEL_KEY.format(channel_id=chid)
 def gkey_counter(chid: int) -> str:     return COUNTER_KEY.format(channel_id=chid)
@@ -92,14 +91,83 @@ def gkey_logchan(chid: int) -> str:     return LOGCHAN_KEY.format(channel_id=chi
 def gkey_postmap(mid: int) -> str:      return POSTMAP_KEY.format(message_id=mid)
 def gkey_pending(log_mid: int) -> str:  return PENDING_KEY.format(log_msg_id=log_mid)
 def gkey_autodel(chid: int) -> str:     return AUTODEL_KEY.format(channel_id=chid)
-def gkey_autoclear(chid: int) -> str:   return AUTOCLEAR_KEY.format(channel_id=chid)
 
-# （後方互換）
+# （後方互換）昔のキーを書き換えた場合に備える
 PENDING_KEY_LEGACY = "anonboard:pending:{message_id}"
 def gkey_pending_legacy(log_mid: int) -> str:
     return PENDING_KEY_LEGACY.format(message_id=log_mid)
 
-# ========= URL抽出 =========
+# ========= 定期掃除（掲示板と無関係） =========
+PURGE_KEY = "cleaner:purge:{channel_id}"  # JSON: {"interval": int, "keep_hours": int, "batch_limit": int}
+def gkey_purge(chid: int) -> str: return PURGE_KEY.format(channel_id=chid)
+_purge_tasks: dict[int, asyncio.Task] = {}
+
+async def _run_purge(channel: discord.TextChannel, interval_sec: int, keep_hours: int, batch_limit: int):
+    """掲示板とは無関係の定期掃除。ピン留め以外を削除。"""
+    while True:
+        try:
+            await asyncio.sleep(interval_sec)
+            cutoff = discord.utils.utcnow() - datetime.timedelta(hours=keep_hours)
+
+            to_delete_bulk, to_delete_single = [], []
+            async for msg in channel.history(limit=1000, oldest_first=False):
+                if len(to_delete_bulk) + len(to_delete_single) >= batch_limit:
+                    break
+                if msg.pinned:
+                    continue
+                if msg.created_at >= cutoff:
+                    continue
+
+                # 14日以内: bulk / 超過: 個別
+                if (discord.utils.utcnow() - msg.created_at) <= datetime.timedelta(days=14):
+                    to_delete_bulk.append(msg)
+                else:
+                    to_delete_single.append(msg)
+
+            if to_delete_bulk:
+                try:
+                    await channel.delete_messages(to_delete_bulk)
+                except Exception:
+                    # 権限/件数などで失敗したら個別に
+                    for m in to_delete_bulk:
+                        try:
+                            await m.delete()
+                        except Exception:
+                            pass
+
+            for m in to_delete_single:
+                try:
+                    await m.delete()
+                except Exception:
+                    pass
+
+            if to_delete_bulk or to_delete_single:
+                log.info(f"[purge] channel={channel.id} deleted bulk={len(to_delete_bulk)} single={len(to_delete_single)} (<{keep_hours}h)")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.exception(f"[purge] error in channel {channel.id}: {e}")
+            continue
+
+async def start_purge_for_channel(bot: commands.Bot, channel_id: int, interval_sec: int, keep_hours: int, batch_limit: int):
+    await stop_purge_for_channel(channel_id)
+    ch = bot.get_channel(channel_id)
+    if not isinstance(ch, discord.TextChannel):
+        return
+    t = asyncio.create_task(_run_purge(ch, interval_sec, keep_hours, batch_limit))
+    _purge_tasks[channel_id] = t
+
+async def stop_purge_for_channel(channel_id: int):
+    t = _purge_tasks.pop(channel_id, None)
+    if t and not t.done():
+        t.cancel()
+        try:
+            await t
+        except Exception:
+            pass
+
+# ========= URL/メッセージリンク 解析 =========
 IMAGE_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|gif|webp)(?:\?.*)?$", re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
@@ -115,7 +183,6 @@ def extract_first_image_url(text: str) -> str | None:
             return m
     return None
 
-# ========= メッセージリンク解析 =========
 MSG_LINK_RE = re.compile(
     r"https?://(?:ptb\.|canary\.)?discord\.com/channels/(?P<guild_id>\d+)/(?P<channel_id>\d+)/(?P<message_id>\d+)"
 )
@@ -142,7 +209,7 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ========= 匿名掲示板 =========
+# ========= 匿名掲示板 UI =========
 class PostModal(discord.ui.Modal, title="投稿内容を入力"):
     """画像付き: 本文は即時公開・画像はログ承認後に追記。画像なし: 即時公開＋ログ記録。"""
     def __init__(self, channel_id: int, is_anonymous: bool):
@@ -181,7 +248,7 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
         if not content:
             return await interaction.followup.send("本文が空です。", ephemeral=True)
 
-        # 画像URL抽出（承認フローに回す）
+        # 画像URL抽出（承認フローへ）
         img = (self.img_url.value or "").strip()
         if not img:
             img = extract_first_image_url(content) or ""
@@ -354,28 +421,26 @@ class BoardView(discord.ui.View):
         await interaction.response.send_modal(PostModal(self.channel_id, is_anonymous=False))
 
 async def repost_panel(client: commands.Bot, channel_id: int):
+    """古いパネルを削除 → 新しいパネルを最下部に再掲してID保存"""
     panel_key = gkey_panel(channel_id)
     panel_id_s = await kv_get(panel_key)
     channel = client.get_channel(channel_id)
     if channel is None or not isinstance(channel, discord.TextChannel):
         return
+
     if panel_id_s and panel_id_s.isdigit():
         try:
             old = await channel.fetch_message(int(panel_id_s))
             await old.delete()
         except Exception:
             pass
+
     view = BoardView(channel_id)
     msg = await channel.send("**匿名掲示板パネル**\n下のボタンから投稿してください。", view=view)
     await kv_set(panel_key, str(msg.id))
 
-# ---- スラッシュグループ ----
+# ---- スラッシュグループ（子コマンドに guild 指定は付けない）----
 board_group = app_commands.Group(name="board", description="匿名掲示板の設定/操作")
-
-def guild_deco(func):
-    if GUILD_IDS:
-        return app_commands.guilds(*[discord.Object(id=g) for g in GUILD_IDS])(func)
-    return func
 
 @board_group.command(name="setup", description="このチャンネル（または指定先）に掲示板パネルを設置")
 @app_commands.describe(
@@ -481,118 +546,16 @@ async def board_autodel_stop(interaction: discord.Interaction):
     await kv_del(gkey_autodel(interaction.channel_id))
     await interaction.response.send_message("このチャンネルの自動削除を **停止** しました。", ephemeral=True)
 
-# ========= 定期的な履歴自動削除（autoclear） =========
-_autoclear_tasks: dict[int, asyncio.Task] = {}
-
-async def _run_autoclear(channel: discord.TextChannel, interval_sec: int, keep_hours: int, batch_limit: int):
-    while True:
-        try:
-            await asyncio.sleep(interval_sec)
-            cutoff = discord.utils.utcnow() - datetime.timedelta(hours=keep_hours)
-
-            panel_id_s = await kv_get(gkey_panel(channel.id))
-            panel_id = int(panel_id_s) if (panel_id_s and panel_id_s.isdigit()) else None
-
-            to_delete_bulk, to_delete_single = [], []
-            async for msg in channel.history(limit=1000, oldest_first=False):
-                if len(to_delete_bulk) + len(to_delete_single) >= batch_limit:
-                    break
-                if msg.pinned:
-                    continue
-                if panel_id and msg.id == panel_id:
-                    continue
-                if msg.created_at >= cutoff:
-                    continue
-                # 14日以内はbulk、超えは個別
-                if (discord.utils.utcnow() - msg.created_at) <= datetime.timedelta(days=14):
-                    to_delete_bulk.append(msg)
-                else:
-                    to_delete_single.append(msg)
-
-            if to_delete_bulk:
-                try:
-                    await channel.delete_messages(to_delete_bulk)
-                except Exception:
-                    for m in to_delete_bulk:
-                        try:
-                            await m.delete()
-                        except Exception:
-                            pass
-            for m in to_delete_single:
-                try:
-                    await m.delete()
-                except Exception:
-                    pass
-
-            if to_delete_bulk or to_delete_single:
-                log.info(f"[autoclear] channel={channel.id} deleted bulk={len(to_delete_bulk)} single={len(to_delete_single)} (<{keep_hours}h)")
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            log.exception(f"[autoclear] error in channel {channel.id}: {e}")
-            continue
-
-async def start_autoclear_for_channel(bot: commands.Bot, channel_id: int, interval_sec: int, keep_hours: int, batch_limit: int):
-    await stop_autoclear_for_channel(channel_id)
-    ch = bot.get_channel(channel_id)
-    if not isinstance(ch, discord.TextChannel):
-        return
-    t = asyncio.create_task(_run_autoclear(ch, interval_sec, keep_hours, batch_limit))
-    _autoclear_tasks[channel_id] = t
-
-async def stop_autoclear_for_channel(channel_id: int):
-    t = _autoclear_tasks.pop(channel_id, None)
-    if t and not t.done():
-        t.cancel()
-        try:
-            await t
-        except Exception:
-            pass
-
-@board_group.command(name="autoclear_start", description="このチャンネルの古い履歴を定期的に削除します")
-@app_commands.describe(
-    interval_seconds="実行間隔（60〜86400秒）",
-    keep_hours="保存期間（1〜720時間：これより古いメッセージを削除）",
-    batch_limit="1回の最大削除数（10〜1000、既定200）"
-)
-async def board_autoclear_start(
-    interaction: discord.Interaction,
-    interval_seconds: app_commands.Range[int, 60, 86400],
-    keep_hours: app_commands.Range[int, 1, 720],
-    batch_limit: app_commands.Range[int, 10, 1000] = 200
-):
-    if not await guard_allowed(interaction):
-        return
-    me = interaction.guild.me if interaction.guild else None
-    if not (me and interaction.channel.permissions_for(me).manage_messages):
-        return await interaction.response.send_message("ボットに **メッセージの管理** 権限が必要です。", ephemeral=True)
-
-    cfg = {"interval": int(interval_seconds), "keep_hours": int(keep_hours), "batch_limit": int(batch_limit)}
-    await kv_set(gkey_autoclear(interaction.channel_id), json.dumps(cfg, ensure_ascii=False))
-    await start_autoclear_for_channel(interaction.client, interaction.channel_id, cfg["interval"], cfg["keep_hours"], cfg["batch_limit"])
-    await interaction.response.send_message(
-        f"✅ 定期削除を開始しました。\n- 実行間隔: **{cfg['interval']}秒**\n- 保存期間: **{cfg['keep_hours']}時間**\n- 1回の上限: **{cfg['batch_limit']}件**",
-        ephemeral=True
-    )
-
-@board_group.command(name="autoclear_stop", description="このチャンネルの定期履歴削除を停止します")
-async def board_autoclear_stop(interaction: discord.Interaction):
-    if not await guard_allowed(interaction):
-        return
-    await kv_del(gkey_autoclear(interaction.channel_id))
-    await stop_autoclear_for_channel(interaction.channel_id)
-    await interaction.response.send_message("⏹️ 定期削除を停止しました。", ephemeral=True)
-
-# ---- トップレベルのギルド専用ショートコマンド（即時反映） ----
+# ---- トップレベル：掲示板とは無関係の定期掃除コマンド（ギルド即時反映）----
 def guild_only_deco(func):
-    return app_commands.guilds(discord.Object(id=PRIMARY_GUILD_ID))(func)
+    # 複数ギルド対応（環境変数 GUILD_IDS に列挙）
+    return app_commands.guilds(*[discord.Object(id=g) for g in (GUILD_IDS or [PRIMARY_GUILD_ID])])(func)
 
-@tree.command(name="purge_start", description="（ショート）一定間隔で古い履歴を自動削除",)
+@tree.command(name="purge_start", description="一定間隔で古い履歴を定期削除（掲示板とは無関係）")
 @guild_only_deco
 @app_commands.describe(
     interval_seconds="実行間隔（60〜86400秒）",
-    keep_hours="保存期間（1〜720時間）",
+    keep_hours="保存期間（1〜720時間：これより古いメッセージを削除）",
     batch_limit="1回の最大削除数（10〜1000、既定200）"
 )
 async def purge_start(
@@ -601,13 +564,28 @@ async def purge_start(
     keep_hours: app_commands.Range[int, 1, 720],
     batch_limit: app_commands.Range[int, 10, 1000] = 200
 ):
-    # /board autoclear_start の糖衣
-    await board_autoclear_start.callback(interaction, interval_seconds, keep_hours, batch_limit)  # type: ignore
+    # Botの権限チェック
+    me = interaction.guild.me if interaction.guild else None
+    if not (me and interaction.channel.permissions_for(me).manage_messages):
+        return await interaction.response.send_message("ボットに **メッセージの管理** 権限が必要です。", ephemeral=True)
 
-@tree.command(name="purge_stop", description="（ショート）自動履歴削除を停止")
+    cfg = {"interval": int(interval_seconds), "keep_hours": int(keep_hours), "batch_limit": int(batch_limit)}
+    await kv_set(gkey_purge(interaction.channel_id), json.dumps(cfg, ensure_ascii=False))
+    await start_purge_for_channel(interaction.client, interaction.channel_id, cfg["interval"], cfg["keep_hours"], cfg["batch_limit"])
+    await interaction.response.send_message(
+        f"✅ 定期掃除を開始しました（掲示板とは無関係）。\n"
+        f"- 実行間隔: **{cfg['interval']}秒**\n"
+        f"- 保存期間: **{cfg['keep_hours']}時間**\n"
+        f"- 1回の上限: **{cfg['batch_limit']}件**",
+        ephemeral=True
+    )
+
+@tree.command(name="purge_stop", description="定期掃除を停止（掲示板とは無関係）")
 @guild_only_deco
 async def purge_stop(interaction: discord.Interaction):
-    await board_autoclear_stop.callback(interaction)  # type: ignore
+    await kv_del(gkey_purge(interaction.channel_id))
+    await stop_purge_for_channel(interaction.channel_id)
+    await interaction.response.send_message("⏹️ 定期掃除を停止しました。", ephemeral=True)
 
 # ---- /ping ----
 @tree.command(name="ping", description="生存確認")
@@ -634,6 +612,7 @@ async def on_message(message: discord.Message):
     if seconds <= 0:
         return
 
+    # ピン留めとパネルは削除対象外（掲示板運用上の仕様）
     if getattr(message, "pinned", False):
         return
     panel_id_s = await kv_get(gkey_panel(message.channel.id))
@@ -655,19 +634,21 @@ async def on_ready():
     user_info = "(user: None)" if bot.user is None else f"{bot.user} (ID: {bot.user.id})"
     log.info(f"Logged in as {user_info}")
     try:
+        # /board グループの登録（子コマンドに guild 指定は不可なので、ツリー側でまとめて同期）
         if board_group not in tree.get_commands():
             tree.add_command(board_group)
-        # ★ ギルド同期（即時反映）
+
+        # ギルド同期（即時反映）
         for gid in GUILD_IDS:
             await tree.sync(guild=discord.Object(id=gid))
             log.info(f"Synced commands to guild {gid}")
     except Exception as e:
         log.exception("Command sync failed: %s", e)
 
-    # 起動時に定期削除タスクを復元
+    # --- 起動時に定期掃除タスクを復元（掲示板とは無関係） ---
     try:
         allkv = await kv_all()
-        prefix = "anonboard:autoclear:"
+        prefix = "cleaner:purge:"
         for k, v in allkv.items():
             if not k.startswith(prefix):
                 continue
@@ -679,10 +660,10 @@ async def on_ready():
             interval = int(cfg.get("interval", 600))
             keep_hours = int(cfg.get("keep_hours", 24))
             batch_limit = int(cfg.get("batch_limit", 200))
-            await start_autoclear_for_channel(bot, ch_id, interval, keep_hours, batch_limit)
-            log.info(f"[autoclear] restored task for channel={ch_id} interval={interval}s keep={keep_hours}h batch={batch_limit}")
+            await start_purge_for_channel(bot, ch_id, interval, keep_hours, batch_limit)
+            log.info(f"[purge] restored task for channel={ch_id} interval={interval}s keep={keep_hours}h batch={batch_limit}")
     except Exception as e:
-        log.exception("restore autoclear failed: %s", e)
+        log.exception("restore purge failed: %s", e)
 
 # ---- main ----
 def main():
