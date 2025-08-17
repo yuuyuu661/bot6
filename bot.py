@@ -4,6 +4,7 @@ import json
 import re
 import asyncio
 import logging
+import datetime
 
 import discord
 from discord.ext import commands
@@ -58,6 +59,11 @@ async def kv_del(key: str):
             del data[key]
             _kv_save(data)
 
+async def kv_all() -> dict:
+    # 全キー取得（定期削除設定の復元に利用）
+    async with _db_lock:
+        return _kv_load()
+
 # ========= 権限/設定 =========
 ALLOWED_USER_IDS = {716667546241335328, 440893662701027328}
 
@@ -74,16 +80,18 @@ async def guard_allowed(interaction: discord.Interaction) -> bool:
 PANEL_KEY    = "anonboard:panel:{channel_id}"
 COUNTER_KEY  = "anonboard:counter:{channel_id}"
 LOGCHAN_KEY  = "anonboard:logchan:{channel_id}"
-POSTMAP_KEY  = "anonboard:post:{message_id}"     # 公開メッセージID -> 投稿者情報(JSON)
-PENDING_KEY  = "anonboard:pending:{log_msg_id}"  # 承認待ちログメッセージID -> 申請情報(JSON)
-AUTODEL_KEY  = "anonboard:autodel_sec:{channel_id}"  # 自動削除の秒数（チャンネル単位）
+POSTMAP_KEY  = "anonboard:post:{message_id}"      # 公開メッセージID -> 投稿者情報(JSON)
+PENDING_KEY  = "anonboard:pending:{log_msg_id}"   # 承認待ちログメッセージID -> 申請情報(JSON)
+AUTODEL_KEY  = "anonboard:autodel_sec:{channel_id}"       # 送信後◯秒で削除（新規のみ）
+AUTOCLEAR_KEY= "anonboard:autoclear:{channel_id}"         # 定期履歴削除の設定(JSON)
 
-def gkey_panel(chid: int) -> str:    return PANEL_KEY.format(channel_id=chid)
-def gkey_counter(chid: int) -> str:  return COUNTER_KEY.format(channel_id=chid)
-def gkey_logchan(chid: int) -> str:  return LOGCHAN_KEY.format(channel_id=chid)
-def gkey_postmap(mid: int) -> str:   return POSTMAP_KEY.format(message_id=mid)
-def gkey_pending(log_mid: int) -> str: return PENDING_KEY.format(log_msg_id=log_mid)
-def gkey_autodel(chid: int) -> str:  return AUTODEL_KEY.format(channel_id=chid)
+def gkey_panel(chid: int) -> str:       return PANEL_KEY.format(channel_id=chid)
+def gkey_counter(chid: int) -> str:     return COUNTER_KEY.format(channel_id=chid)
+def gkey_logchan(chid: int) -> str:     return LOGCHAN_KEY.format(channel_id=chid)
+def gkey_postmap(mid: int) -> str:      return POSTMAP_KEY.format(message_id=mid)
+def gkey_pending(log_mid: int) -> str:  return PENDING_KEY.format(log_msg_id=log_mid)
+def gkey_autodel(chid: int) -> str:     return AUTODEL_KEY.format(channel_id=chid)
+def gkey_autoclear(chid: int) -> str:   return AUTOCLEAR_KEY.format(channel_id=chid)
 
 # （後方互換）昔のコードで {message_id} を使っていた場合に備える
 PENDING_KEY_LEGACY = "anonboard:pending:{message_id}"
@@ -133,7 +141,7 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# ========= UI =========
+# ========= 匿名掲示板 UI =========
 class PostModal(discord.ui.Modal, title="投稿内容を入力"):
     """画像付き: 本文は即時公開・画像はログ承認後に追記。画像なし: 即時公開＋ログ記録。"""
     def __init__(self, channel_id: int, is_anonymous: bool):
@@ -152,7 +160,6 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
         self.add_item(self.img_url)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # 成功時は無通知にするため、まずdefer
         await interaction.response.defer(ephemeral=True, thinking=False)
 
         board_ch = interaction.client.get_channel(self.channel_id)
@@ -173,14 +180,14 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
         if not content:
             return await interaction.followup.send("本文が空です。", ephemeral=True)
 
-        # 画像URL抽出（判定はしない／承認に回す）
+        # 画像URL抽出（承認フローへ）
         img = (self.img_url.value or "").strip()
         if not img:
             img = extract_first_image_url(content) or ""
         img = img.strip()
         has_image = bool(img)
 
-        # まず本文だけ公開
+        # 本文だけ公開
         embed = discord.Embed(description=content, color=discord.Color.blurple())
         embed.set_footer(text=f"投稿者: {display_name}")
         published = await board_ch.send(embed=embed)
@@ -195,33 +202,26 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
             "author_id": interaction.user.id,
             "author_name": str(interaction.user),
             "author_display": interaction.user.display_name,
-            "img_url": None,  # 承認後に更新
+            "img_url": None,
         }
         await kv_set(gkey_postmap(published.id), json.dumps(post_info, ensure_ascii=False))
 
-        # ログ先取得（画像なしもログ送信）
+        # ログ送信
         log_chan_id_s = await kv_get(gkey_logchan(self.channel_id))
         log_ch = interaction.client.get_channel(int(log_chan_id_s)) if (log_chan_id_s and log_chan_id_s.isdigit()) else None
 
-        # 画像なし → ログに記録して終了
         if not has_image:
             if isinstance(log_ch, discord.TextChannel):
-                le = discord.Embed(
-                    title="📝 投稿ログ（画像なし）",
-                    description=content,
-                    color=discord.Color.dark_gray()
-                )
+                le = discord.Embed(title="📝 投稿ログ（画像なし）", description=content, color=discord.Color.dark_gray())
                 le.add_field(name="匿名？", value="はい" if self.is_anonymous else "いいえ", inline=True)
                 le.add_field(name="表示名", value=display_name, inline=True)
                 le.add_field(name="投稿先", value=f"<#{self.channel_id}>", inline=True)
                 le.add_field(name="本文メッセージ", value=f"[ジャンプ]({published.jump_url})", inline=False)
                 le.add_field(name="送信者", value=f"{interaction.user.mention} ({interaction.user.id})", inline=False)
                 await log_ch.send(embed=le)
-
             await repost_panel(interaction.client, board_ch.id)
-            return  # 成功時は無通知
+            return
 
-        # 画像あり → ログに承認カード（常に審査）
         if not isinstance(log_ch, discord.TextChannel):
             await interaction.followup.send(
                 "画像は承認制ですが、ログチャンネルが未設定のため画像は反映できませんでした（本文は公開済み）。\n"
@@ -231,11 +231,7 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
             await repost_panel(interaction.client, board_ch.id)
             return
 
-        pending = discord.Embed(
-            title="🕒 画像承認リクエスト",
-            description=content,
-            color=discord.Color.orange()
-        )
+        pending = discord.Embed(title="🕒 画像承認リクエスト", description=content, color=discord.Color.orange())
         pending.add_field(name="匿名？", value="はい" if self.is_anonymous else "いいえ", inline=True)
         pending.add_field(name="表示名", value=display_name, inline=True)
         pending.add_field(name="投稿先", value=f"<#{self.channel_id}>", inline=True)
@@ -249,7 +245,7 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
         pending_info = {
             "guild_id": interaction.guild_id,
             "board_channel_id": self.channel_id,
-            "board_message_id": published.id,     # 承認時にこのメッセージへ画像を追記
+            "board_message_id": published.id,
             "log_message_id": log_msg.id,
             "anonymous": self.is_anonymous,
             "anon_display": display_name if self.is_anonymous else None,
@@ -260,12 +256,9 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
             "img_url": img
         }
         await kv_set(gkey_pending(log_msg.id), json.dumps(pending_info, ensure_ascii=False))
-
         await repost_panel(interaction.client, board_ch.id)
-        # 成功時は無通知
 
 class ApprovalView(discord.ui.View):
-    """ログチャンネルに出す承認UI（特定ユーザーのみ操作可）。承認で本文メッセージへ画像を追記。"""
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -274,14 +267,12 @@ class ApprovalView(discord.ui.View):
         if not is_allowed_user(interaction.user):
             return await interaction.response.send_message("承認権限がありません。", ephemeral=True)
 
-        # 新→旧の順で検索し、旧が見つかれば新へ移行
         pending_s = await kv_get(gkey_pending(interaction.message.id))
         if not pending_s:
             pending_s = await kv_get(gkey_pending_legacy(interaction.message.id))
             if pending_s:
                 await kv_set(gkey_pending(interaction.message.id), pending_s)
                 await kv_del(gkey_pending_legacy(interaction.message.id))
-
         if not pending_s:
             return await interaction.response.send_message("承認待ち情報が見つかりません。", ephemeral=True)
 
@@ -289,38 +280,28 @@ class ApprovalView(discord.ui.View):
         board_ch = interaction.client.get_channel(int(info["board_channel_id"]))
         if not isinstance(board_ch, discord.TextChannel):
             return await interaction.response.send_message("投稿先チャンネルが見つかりません。", ephemeral=True)
-
-        # 掲示板の本文メッセージを取得して画像を追記
         try:
             target_msg = await board_ch.fetch_message(int(info["board_message_id"]))
         except Exception:
             return await interaction.response.send_message("本文メッセージが取得できませんでした。", ephemeral=True)
 
-        # 既存埋め込みをベースに編集
         if target_msg.embeds:
             base = target_msg.embeds[0]
-            new_embed = discord.Embed(
-                description=base.description or info["content"],
-                color=discord.Color.blurple()
-            )
+            new_embed = discord.Embed(description=base.description or info["content"], color=discord.Color.blurple())
         else:
             new_embed = discord.Embed(description=info["content"], color=discord.Color.blurple())
-
         display_name = info["anon_display"] if info["anonymous"] else info["author_display"]
         new_embed.set_footer(text=f"投稿者: {display_name}")
         if info.get("img_url"):
             new_embed.set_image(url=info["img_url"])
-
         await target_msg.edit(embed=new_embed)
 
-        # 公開マッピング（img_urlを追記更新）
         post_s = await kv_get(gkey_postmap(target_msg.id))
         if post_s:
             post = json.loads(post_s)
             post["img_url"] = info.get("img_url")
             await kv_set(gkey_postmap(target_msg.id), json.dumps(post, ensure_ascii=False))
 
-        # ログ側メッセージ更新＆ボタン無効化
         new_log_embed = interaction.message.embeds[0]
         new_log_embed.title = "✅ 承認・反映済み"
         new_log_embed.color = discord.Color.green()
@@ -328,10 +309,8 @@ class ApprovalView(discord.ui.View):
             child.disabled = True
         await interaction.message.edit(embed=new_log_embed, view=self)
 
-        # 承認待ちレコード掃除（新旧両方）
         await kv_del(gkey_pending(interaction.message.id))
         await kv_del(gkey_pending_legacy(interaction.message.id))
-
         await interaction.response.send_message("承認して掲示板に画像を反映しました。", ephemeral=True)
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, emoji="🛑")
@@ -339,18 +318,15 @@ class ApprovalView(discord.ui.View):
         if not is_allowed_user(interaction.user):
             return await interaction.response.send_message("承認権限がありません。", ephemeral=True)
 
-        # 新→旧の順で検索し、旧が見つかれば新へ移行
         pending_s = await kv_get(gkey_pending(interaction.message.id))
         if not pending_s:
             pending_s = await kv_get(gkey_pending_legacy(interaction.message.id))
             if pending_s:
                 await kv_set(gkey_pending(interaction.message.id), pending_s)
                 await kv_del(gkey_pending_legacy(interaction.message.id))
-
         if not pending_s:
             return await interaction.response.send_message("承認待ち情報が見つかりません。", ephemeral=True)
 
-        # ログ側メッセージ更新＆ボタン無効化（本文は既に公開済みのまま）
         new_log_embed = interaction.message.embeds[0]
         new_log_embed.title = "⛔ 実施せず（本文は公開済み）"
         new_log_embed.color = discord.Color.red()
@@ -358,10 +334,8 @@ class ApprovalView(discord.ui.View):
             child.disabled = True
         await interaction.message.edit(embed=new_log_embed, view=self)
 
-        # 承認待ちレコード掃除（新旧両方）
         await kv_del(gkey_pending(interaction.message.id))
         await kv_del(gkey_pending_legacy(interaction.message.id))
-
         await interaction.response.send_message("却下しました（本文は公開済みのまま）。", ephemeral=True)
 
 class BoardView(discord.ui.View):
@@ -378,20 +352,17 @@ class BoardView(discord.ui.View):
         await interaction.response.send_modal(PostModal(self.channel_id, is_anonymous=False))
 
 async def repost_panel(client: commands.Bot, channel_id: int):
-    """古いパネルを削除 → 新しいパネルを最下部に再掲してID保存"""
     panel_key = gkey_panel(channel_id)
     panel_id_s = await kv_get(panel_key)
     channel = client.get_channel(channel_id)
     if channel is None or not isinstance(channel, discord.TextChannel):
         return
-
     if panel_id_s and panel_id_s.isdigit():
         try:
             old = await channel.fetch_message(int(panel_id_s))
             await old.delete()
         except Exception:
             pass
-
     view = BoardView(channel_id)
     msg = await channel.send("**匿名掲示板パネル**\n下のボタンから投稿してください。", view=view)
     await kv_set(panel_key, str(msg.id))
@@ -418,16 +389,13 @@ async def board_setup(
 ):
     if not await guard_allowed(interaction):
         return
-
     target = channel or interaction.channel
     if not isinstance(target, discord.TextChannel):
         return await interaction.response.send_message("テキストチャンネルで実行してください。", ephemeral=True)
-
     if reset_counter:
         await kv_set(gkey_counter(target.id), "0")
     if log_channel:
         await kv_set(gkey_logchan(target.id), str(log_channel.id))
-
     await repost_panel(interaction.client, target.id)
     txt = f"掲示板パネルを設置しました：{target.mention}\n"
     if log_channel: txt += f"投稿ログ（承認用）：{log_channel.mention}\n"
@@ -476,15 +444,12 @@ async def board_panel(interaction: discord.Interaction, channel: discord.TextCha
 async def board_reveal(interaction: discord.Interaction, message_link: str):
     if not await guard_allowed(interaction):
         return
-
     msg = await fetch_message_from_link(interaction.client, message_link)
     if not msg:
         return await interaction.response.send_message("メッセージリンクが無効です。正しいリンクを指定してください。", ephemeral=True)
-
     data_s = await kv_get(gkey_postmap(msg.id))
     if not data_s:
         return await interaction.response.send_message("このメッセージの記録が見つかりません。匿名掲示板の投稿ではない可能性があります。", ephemeral=True)
-
     info = json.loads(data_s)
     desc = (
         f"**匿名？** {'はい' if info.get('anonymous') else 'いいえ'}\n"
@@ -494,7 +459,7 @@ async def board_reveal(interaction: discord.Interaction, message_link: str):
     )
     await interaction.response.send_message(desc, ephemeral=True)
 
-# ---- 自動削除（開始／停止）----
+# ---- 送信後◯秒で削除（新規のみ） ----
 @board_group.command(name="autodel_start", description="このチャンネルで新規メッセージを自動削除します")
 @app_commands.describe(seconds="削除までの秒数（10〜604800）")
 async def board_autodel_start(interaction: discord.Interaction, seconds: app_commands.Range[int, 10, 604800]):
@@ -514,13 +479,131 @@ async def board_autodel_stop(interaction: discord.Interaction):
     await kv_del(gkey_autodel(interaction.channel_id))
     await interaction.response.send_message("このチャンネルの自動削除を **停止** しました。", ephemeral=True)
 
+# ========= 定期的な履歴自動削除 =========
+_autoclear_tasks: dict[int, asyncio.Task] = {}
+
+async def _run_autoclear(channel: discord.TextChannel, interval_sec: int, keep_hours: int, batch_limit: int):
+    # 注意: bulk delete は Discord の仕様で「14日以内」のメッセージに限られる
+    while True:
+        try:
+            await asyncio.sleep(interval_sec)
+            cutoff = discord.utils.utcnow() - datetime.timedelta(hours=keep_hours)
+
+            # 掲示板パネルは除外
+            panel_id_s = await kv_get(gkey_panel(channel.id))
+            panel_id = int(panel_id_s) if (panel_id_s and panel_id_s.isdigit()) else None
+
+            # 直近から走査して、古いものだけを削除
+            to_delete_bulk = []
+            to_delete_single = []
+            async for msg in channel.history(limit=1000, oldest_first=False):
+                if len(to_delete_bulk) + len(to_delete_single) >= batch_limit:
+                    break
+                if msg.pinned:
+                    continue
+                if panel_id and msg.id == panel_id:
+                    continue
+                if msg.created_at >= cutoff:
+                    continue
+
+                # 14日判定
+                if (discord.utils.utcnow() - msg.created_at) <= datetime.timedelta(days=14):
+                    to_delete_bulk.append(msg)
+                else:
+                    to_delete_single.append(msg)
+
+            # まとめて削除（14日以内）
+            if to_delete_bulk:
+                try:
+                    await channel.delete_messages(to_delete_bulk)
+                except Exception:
+                    # フォールバック：個別削除
+                    for m in to_delete_bulk:
+                        try:
+                            await m.delete()
+                        except Exception:
+                            pass
+
+            # 14日超は個別削除
+            for m in to_delete_single:
+                try:
+                    await m.delete()
+                except Exception:
+                    pass
+
+            if to_delete_bulk or to_delete_single:
+                log.info(f"[autoclear] channel={channel.id} deleted bulk={len(to_delete_bulk)} single={len(to_delete_single)} (cutoff={cutoff.isoformat()})")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.exception(f"[autoclear] error in channel {channel.id}: {e}")
+            # 失敗時も次周期でリトライ
+            continue
+
+async def start_autoclear_for_channel(bot: commands.Bot, channel_id: int, interval_sec: int, keep_hours: int, batch_limit: int):
+    # 既存タスク停止
+    await stop_autoclear_for_channel(channel_id)
+    ch = bot.get_channel(channel_id)
+    if not isinstance(ch, discord.TextChannel):
+        return
+    task = asyncio.create_task(_run_autoclear(ch, interval_sec, keep_hours, batch_limit))
+    _autoclear_tasks[channel_id] = task
+
+async def stop_autoclear_for_channel(channel_id: int):
+    t = _autoclear_tasks.pop(channel_id, None)
+    if t and not t.done():
+        t.cancel()
+        try:
+            await t
+        except Exception:
+            pass
+
+@board_group.command(name="autoclear_start", description="このチャンネルの古い履歴を定期的に削除します")
+@app_commands.describe(
+    interval_seconds="実行間隔（60〜86400秒）",
+    keep_hours="保存期間（1〜720時間：これより古いメッセージを削除）",
+    batch_limit="1回での最大削除数（10〜1000、既定200）"
+)
+async def board_autoclear_start(
+    interaction: discord.Interaction,
+    interval_seconds: app_commands.Range[int, 60, 86400],
+    keep_hours: app_commands.Range[int, 1, 720],
+    batch_limit: app_commands.Range[int, 10, 1000] = 200
+):
+    if not await guard_allowed(interaction):
+        return
+    # 権限チェック（ボット側）
+    me = interaction.guild.me if interaction.guild else None
+    if not (me and interaction.channel.permissions_for(me).manage_messages):
+        return await interaction.response.send_message("ボットに **メッセージの管理** 権限が必要です。", ephemeral=True)
+
+    cfg = {"interval": int(interval_seconds), "keep_hours": int(keep_hours), "batch_limit": int(batch_limit)}
+    await kv_set(gkey_autoclear(interaction.channel_id), json.dumps(cfg, ensure_ascii=False))
+    await start_autoclear_for_channel(interaction.client, interaction.channel_id, cfg["interval"], cfg["keep_hours"], cfg["batch_limit"])
+    await interaction.response.send_message(
+        f"✅ 定期削除を開始しました。\n"
+        f"- 実行間隔: **{cfg['interval']}秒**\n"
+        f"- 保存期間: **{cfg['keep_hours']}時間**（これより古いメッセージを削除）\n"
+        f"- 1回の上限: **{cfg['batch_limit']}件**",
+        ephemeral=True
+    )
+
+@board_group.command(name="autoclear_stop", description="このチャンネルの定期履歴削除を停止します")
+async def board_autoclear_stop(interaction: discord.Interaction):
+    if not await guard_allowed(interaction):
+        return
+    await kv_del(gkey_autoclear(interaction.channel_id))
+    await stop_autoclear_for_channel(interaction.channel_id)
+    await interaction.response.send_message("⏹️ 定期削除を停止しました。", ephemeral=True)
+
 # ---- /ping ----
 @tree.command(name="ping", description="生存確認")
-@guild_deco  # ← ここは付けても外してもOK（子コマンドではないためエラーにならない）
+@guild_deco  # 付けても外してもOK
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong! 🏓", ephemeral=True)
 
-# ---- on_message: 自動削除のスケジュール ----
+# ---- on_message: 送信後◯秒削除のスケジュール ----
 @bot.event
 async def on_message(message: discord.Message):
     await bot.process_commands(message)
@@ -529,6 +612,7 @@ async def on_message(message: discord.Message):
     if message.author is None:
         return
 
+    # 新規メッセージの自動削除（autodel）
     sec_s = await kv_get(gkey_autodel(message.channel.id))
     if not sec_s:
         return
@@ -571,6 +655,26 @@ async def on_ready():
             log.info("Synced global commands")
     except Exception as e:
         log.exception("Command sync failed: %s", e)
+
+    # ---- 起動時に定期削除タスクを復元 ----
+    try:
+        allkv = await kv_all()
+        prefix = "anonboard:autoclear:"
+        for k, v in allkv.items():
+            if not k.startswith(prefix):
+                continue
+            try:
+                ch_id = int(k.split(":")[-1])
+            except Exception:
+                continue
+            cfg = json.loads(v)
+            interval = int(cfg.get("interval", 600))
+            keep_hours = int(cfg.get("keep_hours", 24))
+            batch_limit = int(cfg.get("batch_limit", 200))
+            await start_autoclear_for_channel(bot, ch_id, interval, keep_hours, batch_limit)
+            log.info(f"[autoclear] restored task for channel={ch_id} interval={interval}s keep={keep_hours}h batch={batch_limit}")
+    except Exception as e:
+        log.exception("restore autoclear failed: %s", e)
 
 # ---- main ----
 def main():
