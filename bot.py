@@ -76,25 +76,14 @@ COUNTER_KEY  = "anonboard:counter:{channel_id}"
 LOGCHAN_KEY  = "anonboard:logchan:{channel_id}"
 POSTMAP_KEY  = "anonboard:post:{message_id}"     # 公開メッセージID -> 投稿者情報(JSON)
 PENDING_KEY  = "anonboard:pending:{log_msg_id}"  # 承認待ちログメッセージID -> 申請情報(JSON)
-AUTODEL_KEY  = "anonboard:autodel_sec:{channel_id}"  # ★ 自動削除の秒数（チャンネル単位）
+AUTODEL_KEY  = "anonboard:autodel_sec:{channel_id}"  # 自動削除の秒数（チャンネル単位）
 
-def gkey_panel(chid: int) -> str:
-    return PANEL_KEY.format(channel_id=chid)
-
-def gkey_counter(chid: int) -> str:
-    return COUNTER_KEY.format(channel_id=chid)
-
-def gkey_logchan(chid: int) -> str:
-    return LOGCHAN_KEY.format(channel_id=chid)
-
-def gkey_postmap(mid: int) -> str:
-    return POSTMAP_KEY.format(message_id=mid)
-
-def gkey_pending(log_mid: int) -> str:
-    return PENDING_KEY.format(log_msg_id=log_mid)
-
-def gkey_autodel(chid: int) -> str:
-    return AUTODEL_KEY.format(channel_id=chid)
+def gkey_panel(chid: int) -> str:    return PANEL_KEY.format(channel_id=chid)
+def gkey_counter(chid: int) -> str:  return COUNTER_KEY.format(channel_id=chid)
+def gkey_logchan(chid: int) -> str:  return LOGCHAN_KEY.format(channel_id=chid)
+def gkey_postmap(mid: int) -> str:   return POSTMAP_KEY.format(message_id=mid)
+def gkey_pending(log_mid: int) -> str: return PENDING_KEY.format(log_msg_id=log_mid)
+def gkey_autodel(chid: int) -> str:  return AUTODEL_KEY.format(channel_id=chid)
 
 # （後方互換）昔のコードで {message_id} を使っていた場合に備える
 PENDING_KEY_LEGACY = "anonboard:pending:{message_id}"
@@ -232,7 +221,7 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
             await repost_panel(interaction.client, board_ch.id)
             return  # 成功時は無通知
 
-        # 画像あり → ログに承認カード（ドメイン判定なし・常に審査）
+        # 画像あり → ログに承認カード（常に審査）
         if not isinstance(log_ch, discord.TextChannel):
             await interaction.followup.send(
                 "画像は承認制ですが、ログチャンネルが未設定のため画像は反映できませんでした（本文は公開済み）。\n"
@@ -416,7 +405,6 @@ def guild_deco(func):
     return func
 
 @board_group.command(name="setup", description="このチャンネル（または指定先）に掲示板パネルを設置")
-@guild_deco
 @app_commands.describe(
     channel="掲示板にするテキストチャンネル（未指定ならこのチャンネル）",
     reset_counter="匿名連番を0から再開",
@@ -447,7 +435,6 @@ async def board_setup(
     await interaction.response.send_message(txt, ephemeral=True)
 
 @board_group.command(name="setlog", description="掲示板の投稿ログ先を設定（画像承認用）")
-@guild_deco
 @app_commands.describe(board_channel="掲示板チャンネル（未指定なら実行場所）", log_channel="ログ送信先")
 async def board_setlog(
     interaction: discord.Interaction,
@@ -463,7 +450,6 @@ async def board_setlog(
     await interaction.response.send_message(f"{target.mention} の投稿ログ先を {log_channel.mention} に設定しました。", ephemeral=True)
 
 @board_group.command(name="reset_counter", description="匿名連番を0にリセット")
-@guild_deco
 @app_commands.describe(channel="対象チャンネル（未指定なら実行場所）")
 async def board_reset_counter(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
     if not await guard_allowed(interaction):
@@ -475,7 +461,6 @@ async def board_reset_counter(interaction: discord.Interaction, channel: discord
     await interaction.response.send_message(f"匿名連番をリセットしました：{target.mention}", ephemeral=True)
 
 @board_group.command(name="panel", description="パネルを最下部に再掲")
-@guild_deco
 @app_commands.describe(channel="対象チャンネル（未指定なら実行場所）")
 async def board_panel(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
     if not await guard_allowed(interaction):
@@ -487,7 +472,6 @@ async def board_panel(interaction: discord.Interaction, channel: discord.TextCha
     await interaction.response.send_message(f"パネルを再掲しました：{target.mention}", ephemeral=True)
 
 @board_group.command(name="reveal", description="匿名投稿の実投稿者を照会（指定ユーザーのみ）")
-@guild_deco
 @app_commands.describe(message_link="対象メッセージのリンク（右クリック→リンクをコピー）")
 async def board_reveal(interaction: discord.Interaction, message_link: str):
     if not await guard_allowed(interaction):
@@ -510,9 +494,8 @@ async def board_reveal(interaction: discord.Interaction, message_link: str):
     )
     await interaction.response.send_message(desc, ephemeral=True)
 
-# ---- 自動削除（開始／停止） ----
+# ---- 自動削除（開始／停止）----
 @board_group.command(name="autodel_start", description="このチャンネルで新規メッセージを自動削除します")
-@guild_deco
 @app_commands.describe(seconds="削除までの秒数（10〜604800）")
 async def board_autodel_start(interaction: discord.Interaction, seconds: app_commands.Range[int, 10, 604800]):
     if not await guard_allowed(interaction):
@@ -525,7 +508,6 @@ async def board_autodel_start(interaction: discord.Interaction, seconds: app_com
     )
 
 @board_group.command(name="autodel_stop", description="このチャンネルの自動削除を停止します")
-@guild_deco
 async def board_autodel_stop(interaction: discord.Interaction):
     if not await guard_allowed(interaction):
         return
@@ -534,23 +516,19 @@ async def board_autodel_stop(interaction: discord.Interaction):
 
 # ---- /ping ----
 @tree.command(name="ping", description="生存確認")
-@guild_deco
+@guild_deco  # ← ここは付けても外してもOK（子コマンドではないためエラーにならない）
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong! 🏓", ephemeral=True)
 
 # ---- on_message: 自動削除のスケジュール ----
 @bot.event
 async def on_message(message: discord.Message):
-    # 先にコマンド判定を通す
     await bot.process_commands(message)
-
-    # DMやスレッド・システムメッセージは対象外にする（必要に応じて調整）
     if not isinstance(message.channel, discord.TextChannel):
         return
     if message.author is None:
         return
 
-    # 自動削除の設定を取得
     sec_s = await kv_get(gkey_autodel(message.channel.id))
     if not sec_s:
         return
@@ -561,7 +539,6 @@ async def on_message(message: discord.Message):
     if seconds <= 0:
         return
 
-    # ピン留め・掲示板パネルは削除対象外
     if getattr(message, "pinned", False):
         return
     panel_id_s = await kv_get(gkey_panel(message.channel.id))
@@ -575,7 +552,6 @@ async def on_message(message: discord.Message):
         except Exception:
             pass
 
-    # 非同期で削除予約
     asyncio.create_task(_delete_later(message, seconds))
 
 # ---- ready ----
