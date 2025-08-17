@@ -560,8 +560,8 @@ def guild_only_deco(func):
 )
 async def purge_start(
     interaction: discord.Interaction,
-    interval_seconds: app_commands.Range[int, 60, 86400],
-    keep_hours: app_commands.Range[int, 1, 720],
+    interval_seconds: app_commands.Range[int, 5, 86400],
+    keep_hours: app_commands.Range[int, 0, 720],
     batch_limit: app_commands.Range[int, 10, 1000] = 200
 ):
     # Botの権限チェック
@@ -674,3 +674,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
