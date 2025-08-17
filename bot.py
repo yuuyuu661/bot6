@@ -76,6 +76,7 @@ COUNTER_KEY  = "anonboard:counter:{channel_id}"
 LOGCHAN_KEY  = "anonboard:logchan:{channel_id}"
 POSTMAP_KEY  = "anonboard:post:{message_id}"     # 公開メッセージID -> 投稿者情報(JSON)
 PENDING_KEY  = "anonboard:pending:{log_msg_id}"  # 承認待ちログメッセージID -> 申請情報(JSON)
+AUTODEL_KEY  = "anonboard:autodel_sec:{channel_id}"  # ★ 自動削除の秒数（チャンネル単位）
 
 def gkey_panel(chid: int) -> str:
     return PANEL_KEY.format(channel_id=chid)
@@ -91,6 +92,9 @@ def gkey_postmap(mid: int) -> str:
 
 def gkey_pending(log_mid: int) -> str:
     return PENDING_KEY.format(log_msg_id=log_mid)
+
+def gkey_autodel(chid: int) -> str:
+    return AUTODEL_KEY.format(channel_id=chid)
 
 # （後方互換）昔のコードで {message_id} を使っていた場合に備える
 PENDING_KEY_LEGACY = "anonboard:pending:{message_id}"
@@ -506,11 +510,73 @@ async def board_reveal(interaction: discord.Interaction, message_link: str):
     )
     await interaction.response.send_message(desc, ephemeral=True)
 
+# ---- 自動削除（開始／停止） ----
+@board_group.command(name="autodel_start", description="このチャンネルで新規メッセージを自動削除します")
+@guild_deco
+@app_commands.describe(seconds="削除までの秒数（10〜604800）")
+async def board_autodel_start(interaction: discord.Interaction, seconds: app_commands.Range[int, 10, 604800]):
+    if not await guard_allowed(interaction):
+        return
+    await kv_set(gkey_autodel(interaction.channel_id), str(int(seconds)))
+    await interaction.response.send_message(
+        f"このチャンネルの新規メッセージを **{int(seconds)}秒後** に自動削除します。\n"
+        "※ ピン留めと掲示板パネルは削除対象外です。",
+        ephemeral=True
+    )
+
+@board_group.command(name="autodel_stop", description="このチャンネルの自動削除を停止します")
+@guild_deco
+async def board_autodel_stop(interaction: discord.Interaction):
+    if not await guard_allowed(interaction):
+        return
+    await kv_del(gkey_autodel(interaction.channel_id))
+    await interaction.response.send_message("このチャンネルの自動削除を **停止** しました。", ephemeral=True)
+
 # ---- /ping ----
 @tree.command(name="ping", description="生存確認")
 @guild_deco
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Pong! 🏓", ephemeral=True)
+
+# ---- on_message: 自動削除のスケジュール ----
+@bot.event
+async def on_message(message: discord.Message):
+    # 先にコマンド判定を通す
+    await bot.process_commands(message)
+
+    # DMやスレッド・システムメッセージは対象外にする（必要に応じて調整）
+    if not isinstance(message.channel, discord.TextChannel):
+        return
+    if message.author is None:
+        return
+
+    # 自動削除の設定を取得
+    sec_s = await kv_get(gkey_autodel(message.channel.id))
+    if not sec_s:
+        return
+    try:
+        seconds = int(sec_s)
+    except Exception:
+        return
+    if seconds <= 0:
+        return
+
+    # ピン留め・掲示板パネルは削除対象外
+    if getattr(message, "pinned", False):
+        return
+    panel_id_s = await kv_get(gkey_panel(message.channel.id))
+    if panel_id_s and panel_id_s.isdigit() and int(panel_id_s) == message.id:
+        return
+
+    async def _delete_later(msg: discord.Message, delay: int):
+        try:
+            await asyncio.sleep(delay)
+            await msg.delete()
+        except Exception:
+            pass
+
+    # 非同期で削除予約
+    asyncio.create_task(_delete_later(message, seconds))
 
 # ---- ready ----
 @bot.event
