@@ -416,10 +416,6 @@ class BoardView(discord.ui.View):
     async def post_anon(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(PostModal(self.channel_id, is_anonymous=True))
 
-    @discord.ui.button(label="通常で投稿", style=discord.ButtonStyle.secondary, emoji="🗣️")
-    async def post_public(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(PostModal(self.channel_id, is_anonymous=False))
-
 async def repost_panel(client: commands.Bot, channel_id: int):
     """古いパネルを削除 → 新しいパネルを最下部に再掲してID保存"""
     panel_key = gkey_panel(channel_id)
@@ -674,3 +670,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
