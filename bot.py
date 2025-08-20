@@ -92,7 +92,7 @@ def gkey_postmap(mid: int) -> str:      return POSTMAP_KEY.format(message_id=mid
 def gkey_pending(log_mid: int) -> str:  return PENDING_KEY.format(log_msg_id=log_mid)
 def gkey_autodel(chid: int) -> str:     return AUTODEL_KEY.format(channel_id=chid)
 
-# （後方互換）昔のキーを書き換えた場合に備える
+# （後方互換）
 PENDING_KEY_LEGACY = "anonboard:pending:{message_id}"
 def gkey_pending_legacy(log_mid: int) -> str:
     return PENDING_KEY_LEGACY.format(message_id=log_mid)
@@ -128,7 +128,6 @@ async def _run_purge(channel: discord.TextChannel, interval_sec: int, keep_hours
                 try:
                     await channel.delete_messages(to_delete_bulk)
                 except Exception:
-                    # 権限/件数などで失敗したら個別に
                     for m in to_delete_bulk:
                         try:
                             await m.delete()
@@ -242,7 +241,7 @@ class PostModal(discord.ui.Modal, title="投稿内容を入力"):
             await kv_set(gkey_counter(self.channel_id), str(counter))
             display_name = f"{counter}"
         else:
-            display_name = interaction.user.display_name
+            display_name = interaction.user.display_name  # いまは匿名のみのボタン運用
 
         content = self.content.value.strip()
         if not content:
@@ -412,13 +411,10 @@ class BoardView(discord.ui.View):
         super().__init__(timeout=None)
         self.channel_id = channel_id
 
+    # ★ 通常投稿ボタンを削除し、匿名のみ残す
     @discord.ui.button(label="匿名で投稿", style=discord.ButtonStyle.primary, emoji="🕵️")
     async def post_anon(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(PostModal(self.channel_id, is_anonymous=True))
-
-    @discord.ui.button(label="通常で投稿", style=discord.ButtonStyle.secondary, emoji="🗣️")
-    async def post_public(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(PostModal(self.channel_id, is_anonymous=False))
 
 async def repost_panel(client: commands.Bot, channel_id: int):
     """古いパネルを削除 → 新しいパネルを最下部に再掲してID保存"""
@@ -436,7 +432,7 @@ async def repost_panel(client: commands.Bot, channel_id: int):
             pass
 
     view = BoardView(channel_id)
-    msg = await channel.send("**匿名掲示板パネル**\n下のボタンから投稿してください。", view=view)
+    msg = await channel.send("**匿名掲示板パネル**\n（匿名のみ）下のボタンから投稿してください。", view=view)
     await kv_set(panel_key, str(msg.id))
 
 # ---- スラッシュグループ（子コマンドに guild 指定は付けない）----
@@ -548,14 +544,13 @@ async def board_autodel_stop(interaction: discord.Interaction):
 
 # ---- トップレベル：掲示板とは無関係の定期掃除コマンド（ギルド即時反映）----
 def guild_only_deco(func):
-    # 複数ギルド対応（環境変数 GUILD_IDS に列挙）
     return app_commands.guilds(*[discord.Object(id=g) for g in (GUILD_IDS or [PRIMARY_GUILD_ID])])(func)
 
 @tree.command(name="purge_start", description="一定間隔で古い履歴を定期削除（掲示板とは無関係）")
 @guild_only_deco
 @app_commands.describe(
-    interval_seconds="実行間隔（60〜86400秒）",
-    keep_hours="保存期間（1〜720時間：これより古いメッセージを削除）",
+    interval_seconds="実行間隔（5〜86400秒）",
+    keep_hours="保存期間（0〜720時間：これより古いメッセージを削除）",
     batch_limit="1回の最大削除数（10〜1000、既定200）"
 )
 async def purge_start(
@@ -612,7 +607,7 @@ async def on_message(message: discord.Message):
     if seconds <= 0:
         return
 
-    # ピン留めとパネルは削除対象外（掲示板運用上の仕様）
+    # ピン留めとパネルは削除対象外
     if getattr(message, "pinned", False):
         return
     panel_id_s = await kv_get(gkey_panel(message.channel.id))
@@ -634,7 +629,7 @@ async def on_ready():
     user_info = "(user: None)" if bot.user is None else f"{bot.user} (ID: {bot.user.id})"
     log.info(f"Logged in as {user_info}")
     try:
-        # /board グループの登録（子コマンドに guild 指定は不可なので、ツリー側でまとめて同期）
+        # /board グループの登録
         if board_group not in tree.get_commands():
             tree.add_command(board_group)
 
@@ -645,7 +640,7 @@ async def on_ready():
     except Exception as e:
         log.exception("Command sync failed: %s", e)
 
-    # --- 起動時に定期掃除タスクを復元（掲示板とは無関係） ---
+    # --- 起動時に定期掃除タスクを復元 ---
     try:
         allkv = await kv_all()
         prefix = "cleaner:purge:"
@@ -674,4 +669,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
